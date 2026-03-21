@@ -38,5 +38,12 @@ if __name__ == "__main__":
         required=True,
         help="Name of the trainer to use.",
     )
+    # Add support for DeepSpeed's --local_rank argument
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="Local rank for distributed training (automatically set by DeepSpeed launcher).",
+    )
     args = parser.parse_args()
     main(args.config, args.trainer_name)

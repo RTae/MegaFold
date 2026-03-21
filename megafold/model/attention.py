@@ -5,13 +5,12 @@ from functools import partial
 # import einx
 import torch
 import torch.nn.functional as F
+from megafold.distributed.comm import gather_async_opp
 from beartype.typing import Literal
-
 try:
     from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
 except Exception:
     DS4Sci_EvoformerAttention = None
-import einops
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
@@ -29,6 +28,10 @@ from megafold.utils.model_utils import (
     softclamp,
 )
 from megafold.utils.utils import default, exists, not_exists
+import deepspeed
+
+def get_mem():
+    return deepspeed.accelerator.get_accelerator().memory_allocated() / (1024 * 1024 * 1024)
 
 # alias
 
@@ -162,6 +165,7 @@ class Attention(Module):
         context: Float["b j d"] | None = None,  # type: ignore
         windowed_mask: Bool["b nw w (w*2)"] | None = None,  # type: ignore
         attn_bias: Float["... i j"] | Float["... nw w (w*2)"] | None = None,  # type: ignore
+        attentionMemory = None,
         **kwargs,
     ) -> Float["b i d"]:  # type: ignore
         """Run multi-head attention on a sequence.
@@ -181,7 +185,17 @@ class Attention(Module):
 
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
+        # get back attn_bias here
+        if isinstance(attn_bias, tuple):
+            attn_bias, work, batch_repeat = attn_bias
+            attn_bias = gather_async_opp(attn_bias, work, dim=2)
+            # Triangle Starting: [b * n1/2, heads, n1, n2]
+            # Triangle Ending: [b * n2/2, heads, n2, n1]
+            attn_bias = repeat(attn_bias, "b ... -> (b repeat) ...", repeat=batch_repeat)   
+        
         # attention
+        # note: q, k, v, attn_bias here is not contiguous already
+        before = get_mem()
         out = self.attend(
             q,
             k,
@@ -191,18 +205,20 @@ class Attention(Module):
             windowed_mask=windowed_mask,
             memory_kv=self.memory_kv,
             **kwargs,
-        )                        
-
-
+        )
+        if attentionMemory:
+            attentionMemory.append(get_mem() - before) 
+        
         # merge heads
 
         out = self.merge_heads(out)
 
         # gate output
+        
+        # note: gates here is contiguous 
 
         if exists(self.to_gates):
             gates = self.to_gates(seq)
-            #print('hi', out.is_contiguous(), gates.is_contiguous())
             out = out * gates.sigmoid()
 
         # combine heads
@@ -348,7 +364,7 @@ class Attend(Module):
 
         # similarity
 
-        sim = einops.einsum(q, k, "... i d, ... j d -> ... i j")
+        sim = einsum(q, k, "... i d, ... j d -> ... i j")
 
         if exists(attn_bias):
             if attn_bias.ndim == 4:
@@ -381,7 +397,7 @@ class Attend(Module):
 
         # aggregate
 
-        out = einops.einsum(attn, v, "... i j, ... j d -> ... i d")
+        out = einsum(attn, v, "... i j, ... j d -> ... i d")
 
         # un-window the output
 
@@ -505,7 +521,7 @@ class Attend(Module):
 
             # similarity
 
-            sim = einops.einsum(q, k, "b h i d, b h j d -> b h i j")
+            sim = einsum(q, k, "b h i d, b h j d -> b h i j")
 
             # attn bias
 
@@ -536,7 +552,7 @@ class Attend(Module):
 
             # aggregate values
 
-            out = einops.einsum(attn, v, "b h i j, b h j d -> b h i d")
+            out = einsum(attn, v, "b h i j, b h j d -> b h i d")
 
         # dropout - NOTE: this is applied post-aggregation for compatibility with optimized EvoformerAttention
 

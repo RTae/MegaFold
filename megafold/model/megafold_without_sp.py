@@ -178,11 +178,6 @@ from megafold.utils.utils import (
 )
 from megafold.model.FusedLayernormLinear.fused_layernorm_linear import LayernormLinear
 from megafold.model.FusedTransition.fused_transition import FusedTransition
-from deepspeed.utils.timer import SynchronizedWallClockTimer 
-import time
-import torch.distributed as dist
-from megafold.distributed.parallel_info import get_parallel_info
-from megafold.distributed.comm import scatter, gather, row_to_col, col_to_row, gather_async, gather_async_opp, reduce_sum, reduce_scatter_sum
 
 # constants
 
@@ -431,24 +426,32 @@ class TriangleMultiplication(Module):
         mix: Literal["incoming", "outgoing"] = "incoming",
         dropout=0.0,
         dropout_type: Literal["row", "col"] | None = None,
-        from_pairformer=False,
     ):
         super().__init__()
 
-        self.from_pairformer = from_pairformer
-
         dim_hidden = default(dim_hidden, dim)
         self.dim_hidden = dim_hidden
+
+        # self.pre_ln = LayerNorm(dim)
+        # self.left_right_proj = nn.Sequential(LinearNoBias(dim, dim_hidden * 4), nn.GLU(dim=-1))
+
+        # self.out_gate = LinearNoBias(dim, dim_hidden)
         
+        # NOTE: check correctness here + check if cause up new memory        
         self.combined = LayernormLinear(dim, dim_hidden*5)
         self.glu = nn.GLU(dim=-1)
 
-        self.mix = mix 
         if mix == "outgoing":
             self.mix_einsum_eq = "... i k d, ... j k d -> ... i j d"
         elif mix == "incoming":
-            self.mix_einsum_eq = "... k i d, ... k j d -> ... i j d"
+            self.mix_einsum_eq = "... k j d, ... k i d -> ... i j d"
 
+        # self.to_out_norm = LayerNorm(dim_hidden)
+
+        # self.to_out = Sequential(
+        #     LinearNoBias(dim_hidden, dim),
+        #     Dropout(dropout, dropout_type=dropout_type),
+        # )
         self.to_out = Sequential(
             LayernormLinear(dim_hidden, dim, has_linear_bias=False), 
             Dropout(dropout, dropout_type=dropout_type),
@@ -457,8 +460,8 @@ class TriangleMultiplication(Module):
     @typecheck
     def forward(
         self,
-        x: Float["b n n d"],  # Outgoing: [b, n1/2, n2, dp] | Incoming: [b, n1, n2/2, dp]
-        mask: Bool["b n"] | None = None,
+        x: Float["b n n d"],  # type: ignore
+        mask: Bool["b n"] | None = None,  # type: ignore
     ) -> Float["b n n d"]:  # type: ignore
         """Perform the forward pass.
 
@@ -467,47 +470,26 @@ class TriangleMultiplication(Module):
         :return: The output tensor.
         """
         if exists(mask):
-            mask = to_pairwise_mask(mask) # [b, n, n]
-            mask = rearrange(mask, "... -> ... 1") # [b, n, n, 1]
-            if self.from_pairformer:
-                if self.mix == "outgoing":
-                    mask = scatter(mask, dim=1) # [b, n/2, n, 1]
-                else:
-                    mask = scatter(mask, dim=2) # [b, n, n/2, 1]       
+            mask = to_pairwise_mask(mask)
+            mask = rearrange(mask, "... -> ... 1")
 
-        # Outgoing: [b, n1/2, n2, dim_hidden*5] 
-        # Incoming: [b, n1, n2/2, dim_hidden*5]
+        # left, right = self.left_right_proj(x).chunk(2, dim=-1)
         combined_out = self.combined(x)
-
-        # Outgoing: left_and_right is [b, n1/2, n2, dim_hidden*4] ; out_gate is [b, n1/2, n2, dim_hidden]
-        # Incoming: left_and_right is [b, n1, n2/2, dim_hidden*4] ; out_gate is [b, n1, n2/2, dim_hidden]
         left_and_right, out_gate = combined_out[..., :self.dim_hidden*4], combined_out[..., self.dim_hidden*4:].sigmoid()
-
-        # Outgoing: left = right = [b, n1/2, n2, dim_hidden]
-        # Incoming: left = right= [b, n1, n2/2, dim_hidden]
         left, right = self.glu(left_and_right).chunk(2, dim=-1)
 
         if exists(mask):
-            # Outgoing: [b, n1/2, n2, dim_hidden] * [b, n/2, n, 1] -> [b, n1/2, n2, dim_hidden]
-            # Incoming; [b, n1, n2/2, dim_hidden] * [b, n, n/2, 1] -> [b, n1, n2/2, dim_hidden]
             left = left * mask
             right = right * mask
 
-        # Allgather before einsum
-        if self.from_pairformer:
-            if self.mix == "outgoing":
-                # Outgoing: summation over n2 
-                right = gather(right, 1) # [b, n1/2, n2, dim_hidden] -> [b, n1, n2, dim_hidden]
-            elif self.mix == "incoming":
-                # Incoming: summation over n1
-                left = gather(left, 2) # [b, n1, n2/2, dim_hidden] -> [b, n1, n2, dim_hidden]
+        out = einsum(left, right, self.mix_einsum_eq)
 
-        # Outgoing: [b, n1/2, n2, dim_hidden] @ [b, n1, n2, dim_hidden] = [b, n1/2, n1, dim_hidden]
-        # Incoming: [b, n1, n2, dim_hidden] @ [b, n1, n2/2, dim_hidden] = [b, n2, n2/2, dim_hidden]
-        out = einsum(left, right, self.mix_einsum_eq) 
+        # out = self.to_out_norm(out)
 
-        # Outgoing: [b, n1/2, n1, dp]
-        # Incoming: [b, n2, n2/2, dp]
+        # out_gate = self.out_gate(x).sigmoid()
+
+        # print("out: (K,N)=(128, 128)", out.shape)
+        
         return self.to_out(out) * out_gate
 
 
@@ -526,19 +508,25 @@ class AttentionPairBias(Module):
         dim_pairwise,
         window_size=None,
         num_memory_kv=0,
-        from_pairformer=False,
         **attn_kwargs,
     ):
         super().__init__()
 
-        self.from_pairformer = from_pairformer
         self.window_size = window_size
-        
+
         self.attn = Attention(
             heads=heads, window_size=window_size, num_memory_kv=num_memory_kv, **attn_kwargs
         )
 
         # line 8 of Algorithm 24
+
+        # to_attn_bias_linear = LinearNoBias(dim_pairwise, heads)
+        # nn.init.zeros_(to_attn_bias_linear.weight)
+
+        # self.to_attn_bias = nn.Sequential(
+        #     nn.LayerNorm(dim_pairwise), to_attn_bias_linear, Rearrange("b ... h -> b h ...")
+        # )
+        
         ln_linear = LayernormLinear(dim_pairwise, heads, has_linear_bias=False)
         nn.init.zeros_(ln_linear.linear_weight)
         self.to_attn_bias = nn.Sequential(
@@ -550,7 +538,7 @@ class AttentionPairBias(Module):
         self,
         single_repr: Float["b n ds"],  # type: ignore
         *,
-        pairwise_repr: Float["b n n dp"] | Float["b nw w (w*2) dp"],  # SingleAttentionPairbias (Pairformer): [b, n1/2, n2, dp]
+        pairwise_repr: Float["b n n dp"] | Float["b nw w (w*2) dp"],  # type: ignore
         attn_bias: Float["b n n"] | Float["b nw w (w*2)"] | None = None,  # type: ignore
         verbose: bool = True,
         **kwargs,
@@ -596,13 +584,8 @@ class AttentionPairBias(Module):
         else:
             attn_bias = 0.0
 
-        # SingleAttentionPairbias (Pairformer): [b, heads, n1/2, n2]
+        # print("pairwise_repr: (K,N)=(128, 16)", pairwise_repr.shape)
         attn_bias = self.to_attn_bias(pairwise_repr) + attn_bias
-
-        # Allgather attn_bias: [b, heads, n1/2, n2] -> [b, heads, n1, n2]
-        if self.from_pairformer:
-            attn_bias, work = gather_async(attn_bias, dim=2)
-            attn_bias = (attn_bias, work, 1)
 
         out = self.attn(single_repr, attn_bias=attn_bias, batch_size=b, **kwargs)
         return out
@@ -619,14 +602,11 @@ class TriangleAttention(Module):
         node_type: Literal["starting", "ending"],
         dropout=0.0,
         dropout_type: Literal["row", "col"] | None = None,
-        from_pairformer=False,
         **attn_kwargs,
     ):
         super().__init__()
-        
-        self.from_pairformer = from_pairformer
         self.need_transpose = node_type == "ending"
-        
+
         self.to_attn_bias = nn.Sequential(
             LinearNoBias(dim, heads), Rearrange("... i j h -> ... h i j")
         )
@@ -637,10 +617,10 @@ class TriangleAttention(Module):
     @typecheck
     def forward(
         self,
-        pairwise_repr: Float["b n n d"],  # Starting: [b, n1/2, n2, dp] | Ending: [b, n1, n2/2, dp]
-        mask: Bool["b n"] | None = None,
+        pairwise_repr: Float["b n n d"],  # type: ignore
+        mask: Bool["b n"] | None = None,  # type: ignore
         **kwargs,
-    ) -> Float["b n n d"]:
+    ) -> Float["b n n d"]:  # type: ignore
         """Perform the forward pass.
 
         :param pairwise_repr: The pairwise representation tensor.
@@ -649,46 +629,20 @@ class TriangleAttention(Module):
         """
         b = len(pairwise_repr)
 
-        if self.need_transpose: 
-            # Ending: [b, n1, n2/2, dp] -> [b, n2/2, n1, dp] 
+        if self.need_transpose:
             pairwise_repr = rearrange(pairwise_repr, "b i j d -> b j i d")
 
-        # Starting: [b, heads, n1/2, n2]
-        # Ending: [b, heads, n2/2, n1]
         attn_bias = self.to_attn_bias(pairwise_repr)
-
-        # repeat for mask and attn_bias
-        batch_repeat = pairwise_repr.shape[1] # Starting: n1/2 | Ending: n2/2
-
-        # Allgather bias
-        # Starting: [b, heads, n1/2, n2] -> [b, heads, n1, n2]
-        # Ending: [b, heads, n2/2, n1] -> [b, heads, n2, n1]
-        if self.from_pairformer:
-            attn_bias, work = gather_async(attn_bias, dim=2)
-            attn_bias = (attn_bias, work, batch_repeat)
-        else:
-            attn_bias = repeat(attn_bias, "b ... -> (b repeat) ...", repeat=batch_repeat) 
-
+        batch_repeat = pairwise_repr.shape[1]
         if exists(mask):
-            mask = repeat(mask, "b ... -> (b repeat) ...", repeat=batch_repeat) # [b, n] -> [b*n/2, n]
+            mask = repeat(mask, "b ... -> (b repeat) ...", repeat=batch_repeat)
 
-        # pack 
-        # Starting: [b, n1/2, n2, dp] -> [b * n1/2, n2, dp]
-        # Ending: [b, n2/2, n1, dp] -> [b * n2/2, n1, dp] 
-        pairwise_repr, unpack_one = pack_one(pairwise_repr, "* n d")
-
-        # attention 
-        # Starting: [b * n1/2, n2, dp]
-        # Ending: [b * n2/2, n1, dp]
+        attn_bias = repeat(attn_bias, "b ... -> (b repeat) ...", repeat=batch_repeat)
+        pairwise_repr, unpack_one = pack_one(pairwise_repr, "* n d")  # noqa: F811
         out = self.attn(pairwise_repr, mask=mask, attn_bias=attn_bias, batch_size=b, **kwargs)
-        
-        # unpack
-        # Starting: [b, n1/2, n2, dp]
-        # Ending: [b, n2/2, n1, dp]
         out = unpack_one(out)
 
-        if self.need_transpose: 
-            # Ending: [b, n2/2, n1, dp] -> [b, n1, n2/2, dp]
+        if self.need_transpose:
             out = rearrange(out, "b j i d -> b i j d")
 
         return self.dropout(out)
@@ -711,30 +665,42 @@ class PairwiseBlock(Module):
         tri_attn_heads=4,
         dropout_row_prob=0.25,
         dropout_col_prob=0.25,
-        from_pairformer=False,
     ):
         super().__init__()
-
-        self.from_pairformer = from_pairformer
 
         pre_ln = partial(PreLayerNorm, dim=dim_pairwise)
 
         tri_mult_kwargs = dict(dim=dim_pairwise, dim_hidden=tri_mult_dim_hidden)
+
         tri_attn_kwargs = dict(dim=dim_pairwise, heads=tri_attn_heads, dim_head=tri_attn_dim_head)
 
+        # self.tri_mult_outgoing = pre_ln(
+        #     TriangleMultiplication(
+        #         mix="outgoing",
+        #         dropout=dropout_row_prob,
+        #         dropout_type="row",
+        #         **tri_mult_kwargs,
+        #     )
+        # )
         self.tri_mult_outgoing = TriangleMultiplication(
             mix="outgoing",
             dropout=dropout_row_prob,
             dropout_type="row",
-            from_pairformer=from_pairformer,
             **tri_mult_kwargs,
         )
-
+        
+        # self.tri_mult_incoming = pre_ln(
+        #     TriangleMultiplication(
+        #         mix="incoming",
+        #         dropout=dropout_row_prob,
+        #         dropout_type="row",
+        #         **tri_mult_kwargs,
+        #     )
+        # )
         self.tri_mult_incoming = TriangleMultiplication(
             mix="incoming",
             dropout=dropout_row_prob,
             dropout_type="row",
-            from_pairformer=from_pairformer,
             **tri_mult_kwargs,
         )
         
@@ -743,7 +709,6 @@ class PairwiseBlock(Module):
                 node_type="starting",
                 dropout=dropout_row_prob,
                 dropout_type="row",
-                from_pairformer=from_pairformer,
                 **tri_attn_kwargs,
             )
         )
@@ -752,18 +717,17 @@ class PairwiseBlock(Module):
                 node_type="ending",
                 dropout=dropout_col_prob,
                 dropout_type="col",
-                from_pairformer=from_pairformer,
                 **tri_attn_kwargs,
             )
         )
-        self.pairwise_transition = FusedTransition(dim=dim_pairwise)
+        self.pairwise_transition = FusedTransition(dim=dim_pairwise) # pre_ln(Transition(dim=dim_pairwise))
 
     @typecheck
     def forward(
         self,
         *,
-        pairwise_repr: Float["b n n d"],  # [b, n1/2, n2, dp]
-        mask: Bool["b n"] | None = None,
+        pairwise_repr: Float["b n n d"],  # type: ignore
+        mask: Bool["b n"] | None = None,  # type: ignore
         **kwargs,
     ) -> Float["b n n d"]:  # type: ignore
         """Perform the forward pass.
@@ -773,24 +737,13 @@ class PairwiseBlock(Module):
         :param kwargs: Additional keyword arguments for the attention computation.
         :return: The output tensor.
         """
-        pairwise_repr = self.tri_mult_outgoing(pairwise_repr, mask=mask) + pairwise_repr # [b, n1/2, n2, dp]
-        if self.from_pairformer:
-            pairwise_repr = row_to_col(pairwise_repr) # [b, n1, n2/2, dp]
+        pairwise_repr = self.tri_mult_outgoing(pairwise_repr, mask=mask) + pairwise_repr
+        pairwise_repr = self.tri_mult_incoming(pairwise_repr, mask=mask) + pairwise_repr
+        pairwise_repr = self.tri_attn_starting(pairwise_repr, mask=mask, **kwargs) + pairwise_repr
+        pairwise_repr = self.tri_attn_ending(pairwise_repr, mask=mask, **kwargs) + pairwise_repr
 
-        pairwise_repr = self.tri_mult_incoming(pairwise_repr, mask=mask) + pairwise_repr # [b, n1, n2/2, dp]
-        if self.from_pairformer:
-            pairwise_repr = col_to_row(pairwise_repr) # [b, n1/2, n2, dp]
-    
-        pairwise_repr = self.tri_attn_starting(pairwise_repr, mask=mask, **kwargs) + pairwise_repr # [b, n1/2, n2, dp]
-        if self.from_pairformer:
-            pairwise_repr = row_to_col(pairwise_repr) # [b, n1, n2/2, dp]
-        pairwise_repr = self.tri_attn_ending(pairwise_repr, mask=mask, **kwargs) + pairwise_repr # [b, n1, n2/2, dp]
-        pairwise_repr = self.pairwise_transition(pairwise_repr) + pairwise_repr # [b, n1, n2/2, dp]
-
-        if self.from_pairformer:
-            pairwise_repr = col_to_row(pairwise_repr) # [b, n1/2, n2, dp]
-
-        return pairwise_repr # [b, n1/2, n2, dp]
+        pairwise_repr = self.pairwise_transition(pairwise_repr) + pairwise_repr
+        return pairwise_repr
 
 
 # msa module
@@ -802,17 +755,19 @@ class OuterProductMean(Module):
     def __init__(self, *, dim_msa=64, dim_pairwise=128, dim_hidden=32, eps=1e-5):
         super().__init__()
         self.eps = eps
+        # self.norm = LayerNorm(dim_msa)
+        # self.to_hidden = LinearNoBias(dim_msa, dim_hidden * 2)
         self.to_hidden = LayernormLinear(dim_msa, dim_hidden * 2, has_linear_bias=False)
         self.to_pairwise_repr = nn.Linear(dim_hidden**2, dim_pairwise)
 
     @typecheck
     def forward(
         self,
-        msa: Float["b s n d"], # Split: [b, s/2, n, dm]
+        msa: Float["b s n d"],  # type: ignore
         *,
-        mask: Bool["b n"] | None = None,
-        msa_mask: Bool["b s"] | None = None, # [b, s/2]
-    ) -> Float["b n n dp"]:
+        mask: Bool["b n"] | None = None,  # type: ignore
+        msa_mask: Bool["b s"] | None = None,  # type: ignore
+    ) -> Float["b n n dp"]:  # type: ignore
         """Perform the forward pass.
 
         :param msa: The MSA tensor.
@@ -821,37 +776,52 @@ class OuterProductMean(Module):
         :return: The output tensor.
         """
         dtype = msa.dtype
+        # print("msa: (K,N)=(64,64)", msa.shape)
+        # msa = self.norm(msa)
 
-        a, b = self.to_hidden(msa).chunk(2, dim=-1) # a.shape = b.shape = [b, s/2, n, dim_hidden]
+        # line 2
+
+        a, b = self.to_hidden(msa).chunk(2, dim=-1)
         
+
         # maybe masked mean for outer product
+
         if exists(msa_mask):
-            msa_mask, num_true_in_msa_mask = msa_mask
+            # a = einx.multiply("b s i d, b s -> b s i d", a, msa_mask.type(dtype))
+            # b = einx.multiply("b s j e, b s -> b s j e", b, msa_mask.type(dtype))
             a = a * msa_mask[..., None, None].type(dtype)
             b = b * msa_mask[..., None, None].type(dtype)
-        
-        # [b, s/2, n1, dm] * [b, s/2, n2, dm] -> [b, n1, n2, dm, dm]: summation over `s/2` on that GPU only
-        outer_product = einsum(a, b, "b s i d, b s j e -> b i j d e")
-        outer_product = rearrange(outer_product, "... d e -> ... (d e)") # [b, n1, n2, dm**2]
-        if exists(mask):
-            mask_2d = to_pairwise_mask(mask) # [b, n, n]
-            outer_product = outer_product * mask_2d[..., None].type(dtype) # [b, n1, n2, dm**2]
-        pairwise_repr = self.to_pairwise_repr(outer_product)# [b, n1, n2, dp]
 
-        if exists(msa_mask):
-            pairwise_repr = pairwise_repr / num_true_in_msa_mask[..., None, None, None].clamp(min=self.eps)
+            outer_product = einsum(a, b, "b s i d, b s j e -> b i j d e")
+
+            num_msa = reduce(msa_mask.type(dtype), "... s -> ...", "sum")
+
+            # outer_product_mean = einx.divide(
+            #     "b i j d e, b", outer_product, num_msa.clamp(min=self.eps)
+            # )
+            outer_product_mean = outer_product / num_msa[..., None, None, None, None].clamp(
+                min=self.eps
+            )
         else:
-            num_msa = msa.shape[1] * get_parallel_info()["sp_size"]
-            pairwise_repr = pairwise_repr / num_msa
+            num_msa = msa.shape[1]
+            outer_product = einsum(a, b, "b s i d, b s j e -> b i j d e")
+            outer_product_mean = outer_product / num_msa
 
-        # Previously, only summation over `s/2` on each GPU -> need to all-reduce sum across ranks. 
-        # Then, since each GPU only needs half of pairwise_repr -> scatter()
-        # pairwise_repr = reduce_sum(pairwise_repr)
-        # pairwise_repr = scatter(pairwise_repr, dim=1)
-        # -> combine into one step: reduce_scatter_sum()
-        pairwise_repr = reduce_scatter_sum(pairwise_repr, dim=1)  # [b, n1/2, n2, dp]
+        # flatten
+
+        outer_product_mean = rearrange(outer_product_mean, "... d e -> ... (d e)")
+
+        # masking for pairwise repr
+
+        if exists(mask):
+            mask = to_pairwise_mask(mask)
+            # outer_product_mean = einx.multiply(
+            #     "b i j d, b i j", outer_product_mean, mask.type(dtype)
+            # )
+            outer_product_mean = outer_product_mean * mask[..., None].type(dtype)
+
+        pairwise_repr = self.to_pairwise_repr(outer_product_mean)
         return pairwise_repr
-
 
 class MSAPairWeightedAveraging(Module):
     """Algorithm 10."""
@@ -870,11 +840,15 @@ class MSAPairWeightedAveraging(Module):
         dim_inner = dim_head * heads
 
         self.msa_to_values_and_gates = nn.Sequential(
+            #LayerNorm(dim_msa),
+            #LinearNoBias(dim_msa, dim_inner * 2),
             LayernormLinear(dim_msa, dim_inner * 2, has_linear_bias=False), 
             Rearrange("b s n (gv h d) -> gv b h s n d", gv=2, h=heads),
         )
 
         self.pairwise_repr_to_attn = nn.Sequential(
+            # LayerNorm(dim_pairwise),
+            # LinearNoBias(dim_pairwise, heads),
             LayernormLinear(dim_pairwise, heads, has_linear_bias=False),
             Rearrange("b i j h -> b h i j"),
         )
@@ -889,10 +863,10 @@ class MSAPairWeightedAveraging(Module):
     def forward(
         self,
         *,
-        msa: Float["b s n d"],  # [b, s/2, n, dm]
-        pairwise_repr: Float["b n n dp"],  # [b, n/2, n, dp]
-        mask: Bool["b n"] | None = None,
-    ) -> Float["b s n d"]: # [b, s/2, n, dm]
+        msa: Float["b s n d"],  # type: ignore
+        pairwise_repr: Float["b n n dp"],  # type: ignore
+        mask: Bool["b n"] | None = None,  # type: ignore
+    ) -> Float["b s n d"]:  # type: ignore
         """Perform the forward pass.
 
         :param msa: The MSA tensor.
@@ -900,30 +874,32 @@ class MSAPairWeightedAveraging(Module):
         :param mask: The mask tensor.
         :return: The output tensor.
         """
-        b = self.pairwise_repr_to_attn(pairwise_repr) # [b, heads, n1/2, n2]
-        # Allgather pairbias: [b, heads, n1/2, n2] -> [b, heads, n1, n2]
-        b, work = gather_async(b, dim=2)  # [b, heads, n1, n2]
-
-        # [b, s/2, n, dm] -> [b, s/2, n, di*2] -> [2, b, heads, s/2, n, dim_heads]
-        values, gates = self.msa_to_values_and_gates(msa) # [b, heads, s/2, n, dim_heads]
+        # print("msa: (K,N)=(64,512)", msa.shape)
+        
+        values, gates = self.msa_to_values_and_gates(msa)
         gates = gates.sigmoid()
 
-        b = gather_async_opp(b, work, dim=2) # [b, heads, n1, n2]
+        # line 3
+        # print("pairwise_repr:  (K, N) = (128, 8)", pairwise_repr.shape)
+        b = self.pairwise_repr_to_attn(pairwise_repr)
 
         if exists(mask):
-            mask = rearrange(mask, "b j -> b 1 1 j") # [b, n] -> [b, 1, 1, n]
-            b = b.masked_fill(~mask, max_neg_value(b)) # mask on full b
+            mask = rearrange(mask, "b j -> b 1 1 j")
+            b = b.masked_fill(~mask, max_neg_value(b))
 
-        weights = b.softmax(dim=-1) # [b, heads, n1, n2]
+        # line 5
 
-        # [b, heads, n1, n2] * [b, heads, s/2, n2, dim_heads] -> [b, heads, s/2, n1, dim_heads]
+        weights = b.softmax(dim=-1)
+
+        # line 6
+
         out = einsum(weights, values, "b h i j, b h s j d -> b h s i d")
 
-        # [b, heads, s/2, n1, dim_heads] * [b, heads, s/2, n, dim_heads] = [b, heads, s/2, n, dim_heads]
         out = out * gates
 
         # combine heads
-        return self.to_out(out) # [b, s/2, n, dm]
+
+        return self.to_out(out)
 
 
 class MSAModule(Module):
@@ -983,7 +959,6 @@ class MSAModule(Module):
 
             pairwise_block = PairwiseBlock(
                 dim_pairwise=dim_pairwise,
-                from_pairformer=True,
                 **pairwise_block_kwargs,
             )
 
@@ -992,7 +967,7 @@ class MSAModule(Module):
                     [
                         outer_product_mean,
                         msa_pair_weighted_avg,
-                        msa_transition,
+                        msa_transition, # msa_pre_ln(msa_transition),
                         pairwise_block,
                     ]
                 )
@@ -1037,19 +1012,19 @@ class MSAModule(Module):
             pairwise_block,
         ) in self.layers:
             # communication between msa and pairwise rep
+
             pairwise_repr = outer_product_mean(msa, mask=mask, msa_mask=msa_mask) + pairwise_repr
 
             msa = msa_pair_weighted_avg(msa=msa, pairwise_repr=pairwise_repr, mask=mask) + msa
             msa = msa_transition(msa) + msa
 
             # pairwise block
+
             pairwise_repr = pairwise_block(pairwise_repr=pairwise_repr, mask=mask, **kwargs)
 
         # ensure the MSA weights are always in the computational graph
-        # adapt to sharded first-n: scatter the seed across the first n dim
-        msa_seed = msa.mean((-3, -1))[..., None, None]  # [b, n, 1, 1]
-        msa_seed = scatter(msa_seed, dim=1)  # [b, n/2, 1, 1] to match sharded pairwise
-        pairwise_repr = pairwise_repr + (0.0 * msa_seed)
+
+        pairwise_repr = pairwise_repr + (0.0 * msa.mean((-3, -1))[..., None, None])
 
         return pairwise_repr
 
@@ -1130,9 +1105,8 @@ class MSAModule(Module):
         pairwise_repr, _, msa, *_ = inputs
 
         # ensure the MSA weights are always in the computational graph
-        msa_seed = msa.mean((-3, -1))[..., None, None] # [b, n, 1, 1]
-        msa_seed = scatter(msa_seed, dim=1) # [b, n/2, 1, 1] to match sharded pairwise
-        pairwise_repr = pairwise_repr + (0.0 * msa_seed)
+
+        pairwise_repr = pairwise_repr + (0.0 * msa.mean((-3, -1))[..., None, None])
 
         return pairwise_repr
 
@@ -1159,7 +1133,6 @@ class MSAModule(Module):
         :param kwargs: Additional keyword arguments for the attention computation.
         :return: The output tensor.
         """
-        
         batch, num_msa, device = *msa.shape[:2], msa.device
 
         # sample without replacement
@@ -1172,15 +1145,21 @@ class MSAModule(Module):
 
             indices = rand.topk(self.max_num_msa, dim=-1).indices
 
+            # msa = einx.get_at('b [s] n dm, b sampled -> b sampled n dm', msa, indices)
+
             msa, unpack_one = pack_one(msa, "b s *")
             msa_indices = repeat(indices, "b sampled -> b sampled d", d=msa.shape[-1])
             msa = msa.gather(1, msa_indices)
             msa = unpack_one(msa)
 
             if exists(msa_mask):
+                # msa_mask = einx.get_at('b [s], b sampled -> b sampled', msa_mask, indices)
+
                 msa_mask = msa_mask.gather(1, indices)
 
             if exists(additional_msa_feats):
+                # additional_msa_feats = einx.get_at('b s 2, b sampled -> b sampled 2', additional_msa_feats, indices)
+
                 additional_msa_feats, unpack_one = pack_one(additional_msa_feats, "b s *")
                 additional_msa_indices = repeat(
                     indices, "b sampled -> b sampled d", d=additional_msa_feats.shape[-1]
@@ -1206,29 +1185,6 @@ class MSAModule(Module):
 
         msa = rearrange(single_msa_feats, "b n d -> b 1 n d") + msa
 
-        # BEFORE all MSAModule layers: split msa along `s` and pairwise_repr along first `n`
-        sp_size = get_parallel_info()["sp_size"]
-        seq_length = single_repr.shape[1]
-        padding_size = (sp_size - (seq_length % sp_size)) % sp_size
-        num_msa = msa.shape[1]
-        msa_padding = (sp_size - (num_msa % sp_size)) % sp_size
-
-        # pad along sequence dims (n) for pairwise and msa, and along s for msa / msa_mask
-        pairwise_repr = torch.nn.functional.pad(pairwise_repr, (0, 0, 0, padding_size, 0, padding_size)) # [b, n, n, dp]
-        msa = torch.nn.functional.pad(msa, (0, 0, 0, padding_size, 0, msa_padding)) # [b, s, n, dm]
-        if exists(mask):
-            mask = torch.nn.functional.pad(mask, pad=(0, padding_size), value=False)
-        if exists(msa_mask):
-            msa_mask = torch.nn.functional.pad(msa_mask, (0, msa_padding), value=False)
-
-        # scatter along `s` for msa and first `n` for pairwise
-        msa = scatter(msa, dim=1)
-        pairwise_repr = scatter(pairwise_repr, dim=1)
-        if exists(msa_mask):
-            num_true_in_msa_mask = reduce(msa_mask.type(msa.dtype), "... s -> ...", "sum")
-            msa_mask = scatter(msa_mask, dim=1)
-            msa_mask = (msa_mask, num_true_in_msa_mask)
-    
         # going through the layers
 
         if should_checkpoint(self, (pairwise_repr, msa)):
@@ -1240,18 +1196,10 @@ class MSAModule(Module):
             msa=msa, mask=mask, pairwise_repr=pairwise_repr, msa_mask=msa_mask, **kwargs
         )
 
-        # AFTER all MSAModule layers: allgather back msa and pairwise_repr, then unpad
-        msa = gather(msa, dim=1)
-        pairwise_repr = gather(pairwise_repr, dim=1)
-        # unpad
-        if padding_size > 0:
-            pairwise_repr = pairwise_repr[:, :-padding_size, :-padding_size, :]
-            msa = msa[:, :, :-padding_size, :] # also need to unpad msa
-        if msa_padding > 0:
-            msa = msa[:, :-msa_padding, :, :]
-
         # final masking and then layer scale
+
         if exists(msa_mask):
+            # pairwise_repr = einx.where("b, b ..., -> b ...", has_msa, pairwise_repr, 0.0)
             pairwise_repr = pairwise_repr * has_msa[..., None, None, None]
 
         return pairwise_repr * self.layerscale_output
@@ -1295,11 +1243,10 @@ class PairformerStack(Module):
 
             pairwise_block = PairwiseBlock(
                 dim_pairwise=dim_pairwise,
-                from_pairformer=True,
                 **pairwise_block_kwargs,
             )
 
-            pair_bias_attn = AttentionPairBias(from_pairformer=True, **pair_bias_attn_kwargs)
+            pair_bias_attn = AttentionPairBias(**pair_bias_attn_kwargs)
             single_transition = FusedTransition(dim=dim_single)
 
             layers.append(
@@ -1307,7 +1254,7 @@ class PairformerStack(Module):
                     [
                         pairwise_block,
                         single_pre_ln(pair_bias_attn),
-                        single_transition,
+                        single_transition, # single_pre_ln(single_transition),
                     ]
                 )
             )
@@ -1477,27 +1424,11 @@ class PairformerStack(Module):
         else:
             to_layers_fn = self.to_layers
 
-        # BEFORE pairformer blocks: scatter pairwise_repr
-        sp_size = get_parallel_info()["sp_size"] 
-        seq_length = single_repr.shape[1]
-        padding_size = (sp_size - (seq_length % sp_size)) % sp_size # amount of padding needed to make seq_length divisible by sp_size
-        
-        pairwise_repr = torch.nn.functional.pad(pairwise_repr, (0, 0, 0, padding_size, 0, padding_size))
-        single_repr = torch.nn.functional.pad(single_repr, (0, 0, 0, padding_size))
-        mask = torch.nn.functional.pad(mask, pad=(0, padding_size), value=False)
-
-        pairwise_repr = scatter(pairwise_repr, dim=1) # [b, n1/2, n2, dp]
-
         # main transformer block layers
+
         single_repr, pairwise_repr = to_layers_fn(
             single_repr=single_repr, pairwise_repr=pairwise_repr, mask=mask, **kwargs
         )
-
-        # AFTER pairformer blocks: allgather
-        pairwise_repr = gather(pairwise_repr, dim=1) # [b, n1, n2, dp]
-        if padding_size > 0:
-            pairwise_repr = pairwise_repr[:, :-padding_size, :-padding_size, :] # unpad
-            single_repr = single_repr[:, :-padding_size, :]
 
         # splice out registers
 
@@ -1605,11 +1536,15 @@ class TemplateEmbedder(Module):
 
         self.template_feats_to_embed_input = LinearNoBias(dim_template_feats, dim)
 
+        # self.pairwise_to_embed_input = nn.Sequential(
+        #     LayerNorm(dim_pairwise), LinearNoBias(dim_pairwise, dim)
+        # )
         self.pairwise_to_embed_input = LayernormLinear(dim_pairwise, dim, has_linear_bias=False)
 
         layers = ModuleList([])
         for _ in range(pairformer_stack_depth):
             block = PairwiseBlock(dim_pairwise=dim, **pairwise_block_kwargs)
+
             layers.append(block)
 
         self.pairformer_stack = layers
@@ -1702,6 +1637,7 @@ class TemplateEmbedder(Module):
         dtype = templates.dtype
         num_templates = templates.shape[1]
 
+        # print("pairwise_repr: (K,N)= (128,64)", pairwise_repr.shape)
         pairwise_repr = self.pairwise_to_embed_input(pairwise_repr)
         pairwise_repr = rearrange(pairwise_repr, "b i j d -> b 1 i j d")
 
@@ -1844,11 +1780,9 @@ class SingleConditioning(Module):
         dim_fourier=256,
         num_transitions=2,
         transition_expansion_factor=2,
-        flow=False,
         eps=1e-20,
     ):
         super().__init__()
-        self.flow = flow
         self.eps = eps
 
         self.dim_single = dim_single
@@ -1898,7 +1832,7 @@ class SingleConditioning(Module):
         single_repr = self.norm_single(single_repr)
 
         fourier_embed = self.fourier_embed(
-            times if self.flow else 0.25 * log(times / self.sigma_data, eps=self.eps)
+            0.25 * log(times / self.sigma_data, eps=self.eps)
         )
 
         normed_fourier = self.norm_fourier(fourier_embed)
@@ -2255,7 +2189,6 @@ class DiffusionModule(Module):
         token_transformer_kwargs: dict = dict(),
         use_linear_attn=False,
         checkpoint=False,
-        flow=False,
         linear_attn_kwargs: dict = dict(heads=8, dim_head=16),
     ):
         super().__init__()
@@ -2268,7 +2201,6 @@ class DiffusionModule(Module):
             sigma_data=sigma_data,
             dim_single=dim_single,
             dim_fourier=dim_fourier,
-            flow=flow,
             **single_cond_kwargs,
         )
 
@@ -2457,6 +2389,7 @@ class DiffusionModule(Module):
         atom_feats = noised_atom_pos_feats + atom_feats
 
         # condition atom feats cond (cl) with single repr
+        # print("conditioned_single_repr: (K, N)=(384, 128)", conditioned_single_repr.shape)
         single_repr_cond = self.single_repr_to_atom_feat_cond(conditioned_single_repr)
 
         single_repr_cond = batch_repeat_interleave(single_repr_cond, molecule_atom_lens)
@@ -2476,6 +2409,7 @@ class DiffusionModule(Module):
             )
 
         # condition atompair feats with pairwise repr
+        # print("conditioned_pairwise_repr: (K, N)=(128, 16)", conditioned_pairwise_repr.shape)
         pairwise_repr_cond = self.pairwise_repr_to_atompair_feat_cond(conditioned_pairwise_repr)
 
         indices = torch.arange(seq_len, device=device)
@@ -2509,6 +2443,7 @@ class DiffusionModule(Module):
         atompair_feats = pairwise_repr_cond + atompair_feats
 
         # condition atompair feats further with single atom repr
+        # print("atom_feats: (K, N)=(128, 32)", atom_feats.shape)
         atom_repr_cond = self.atom_repr_to_atompair_feat_cond(atom_feats)
         atom_repr_cond = pad_and_window(atom_repr_cond, w)
 
@@ -2567,6 +2502,7 @@ class DiffusionModule(Module):
         )
 
         # token transformer
+        # print("conditioned_single_repr: (K,N)=(384,768)", conditioned_single_repr.shape)
         tokens = self.cond_tokens_with_cond_single(conditioned_single_repr) + tokens
 
         tokens = self.token_transformer(
@@ -2580,6 +2516,7 @@ class DiffusionModule(Module):
         # tokens = self.attended_token_norm(tokens)
 
         # atom decoder
+        # print("tokens: (K,N)=(768,128)", tokens.shape)
         atom_decoder_input = self.tokens_to_atom_decoder_input_cond(tokens)
 
         atom_decoder_input = batch_repeat_interleave(atom_decoder_input, molecule_atom_lens)
@@ -2598,6 +2535,7 @@ class DiffusionModule(Module):
             use_optimized_evo=None,
         )
         
+        # print("atom_feats: (K,N)=(128,3)", atom_feats.shape)
         atom_pos_update = self.atom_feat_to_atom_pos_update(atom_feats)
 
         return atom_pos_update
@@ -3062,7 +3000,7 @@ class ElucidatedAtomDiffusion(Module):
 
         with torch.no_grad():
             num_augs = self.diffusion_num_augmentations + int(self.stochastic_frame_average)
-            diffusion_chunk_size = default(self.diffusion_chunk_size, num_augs) # 4
+            diffusion_chunk_size = default(self.diffusion_chunk_size, num_augs)
             aug_atom_pos = repeat(atom_pos_ground_truth, "b ... -> (b a) ...", a=num_augs)
 
             # center the ground truth coordinates while accounting for masking
@@ -3103,7 +3041,7 @@ class ElucidatedAtomDiffusion(Module):
 
         # diffusion loss
 
-        sigmas = self.noise_distribution(batch_size * num_augs).type(dtype) # (48,): too small - not worth splitting
+        sigmas = self.noise_distribution(batch_size * num_augs).type(dtype)
         padded_sigmas = rearrange(sigmas, "b -> b 1 1")
 
         noise = torch.randn_like(aug_atom_pos) * padded_sigmas
@@ -3117,697 +3055,22 @@ class ElucidatedAtomDiffusion(Module):
             logger.info("Running preconditioned network forward pass within EDM")
 
         denoised_atom_pos = []
-        num_aug_chunks = num_augs // diffusion_chunk_size + (num_augs % diffusion_chunk_size != 0) # 12
+        num_aug_chunks = num_augs // diffusion_chunk_size + (num_augs % diffusion_chunk_size != 0)
+        for i in range(num_aug_chunks):
+            # NOTE: `alphas` are `1.0` in the AF3 paper
+            noised_atom_pos_i = (aug_atom_pos + noise)[
+                ..., i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size, :, :
+            ]
+            sigmas_i = sigmas[..., i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size]
 
-        """
-        Handle scatter() here:
-        48 augmentations; split into 12 chunks of 4
-        If there are (sp_size)(Ex:2) GPUs -> Each GPU will handle (12 // sp_size)(6) chunks
-        -> GPU0 will handle the first (12//sp_size)(6) chunks; GPU1 will handle the next (12//sp_size)(6) chunks; ...
-        After scatter(), each GPU will iterate over those chunks to compute locally
-        """
-        parallel_info = get_parallel_info()
-        sp_size = parallel_info["sp_size"]
-        local_rank_within_sequence_parallel_group = parallel_info["sp_rank"]
-        num_chunks_per_gpu = num_aug_chunks // sp_size # 12//2 = 6 chunks of 4 augmentations per GPU
-        chunk_offset = local_rank_within_sequence_parallel_group * num_chunks_per_gpu # GPU0: 0; GPU1: 6
-        noised_aug_atom_pos = aug_atom_pos + noise # [48, m, 3]
-
-        noised_aug_atom_pos = scatter(noised_aug_atom_pos, 0) # [24, m, 3], scattered on each gpu
-
-        # Now, iterating on each GPU within the SP group
-        for i in range(num_chunks_per_gpu): # 6
-            noised_atom_pos_i = noised_aug_atom_pos[..., i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size, :, :] # torch.Size([4, m, 3])
-            sigmas_i = sigmas[..., (chunk_offset + i) * diffusion_chunk_size : (chunk_offset + i + 1) * diffusion_chunk_size] # (4, )
-            diffusion_chunk_size_ = len(sigmas_i) # 4
-
+            diffusion_chunk_size_ = len(sigmas_i)
             mask_i = mask.expand(diffusion_chunk_size // batch_size, -1)[
                 :diffusion_chunk_size_, ...
-            ] # [1, n] -> [4,n] -> [4, n]
+            ]
 
             denoised_atom_pos_i = self.preconditioned_network_forward(
                 noised_atom_pos_i,
                 sigmas_i,
-                network_condition_kwargs=dict(
-                    atom_feats=atom_feats,
-                    atom_mask=atom_mask,
-                    missing_atom_mask=missing_atom_mask,
-                    atompair_feats=atompair_feats,
-                    atom_parent_ids=atom_parent_ids,
-                    mask=mask_i,
-                    single_trunk_repr=single_trunk_repr,
-                    single_inputs_repr=single_inputs_repr,
-                    pairwise_trunk=pairwise_trunk,
-                    pairwise_rel_pos_feats=pairwise_rel_pos_feats,
-                    molecule_atom_lens=molecule_atom_lens,
-                    use_optimized_evo=use_optimized_evo,
-                ),
-            ) # torch.Size([4, m, 3])
-            denoised_atom_pos.append(denoised_atom_pos_i) # outputs are appended to the list denoised_atom_pos
-        # after the loop, on each GPU, denoised_atom_pos = [6x torch.Tensor([4, m, 3])]
-        denoised_atom_pos = torch.cat(denoised_atom_pos, dim=0) # [24, m, 3]
-        # all_gather
-        denoised_atom_pos = gather(denoised_atom_pos, dim=0) # [48, m, 3]]
-        # Now, after all_gather, all GPUs within an SP group will have all the same full denoised_atom_pos -> they will continue (duplicately) calculate loss
-        
-        # section 3.7.1 equation 2 - weighted rigid aligned ground truth
-
-        amp_context = (
-            torch.autocast(device_type="cuda", enabled=False, cache_enabled=False)
-            if torch.cuda.is_available()
-            else nullcontext()
-        )
-
-        with torch.no_grad(), amp_context:
-            if verbose:
-                logger.info("Calculating weighted rigid aligned ground truth within EDM")
-
-            align_weights = calculate_weighted_rigid_align_weights(
-                atom_pos=denoised_atom_pos,
-                molecule_atom_lens=molecule_atom_lens,
-                is_molecule_types=is_molecule_types,
-                nucleotide_loss_weight=nucleotide_loss_weight,
-                ligand_loss_weight=ligand_loss_weight,
-            )
-
-            aug_atom_pos_aligned = weighted_rigid_align(
-                pred_coords=denoised_atom_pos.float(),
-                true_coords=aug_atom_pos.float(),
-                weights=align_weights.float(),
-                mask=atom_mask,
-            ).type(dtype)
-
-        # section 4.2 - multi-chain permutation alignment
-
-        # NOTE: since the ground-truth chains are cropped during diffusion training,
-        # we do not perform multi-chain permutation alignment for diffusion training
-
-        # section 4.2 - atom permutation alignment
-
-        # NOTE: to simplify the implementation, we optimally permute the atoms in the
-        # predicted structure to match the ground truth, in constrast to matching the
-        # ground truth atoms to the predicted atoms as done in the AF3 paper
-
-        if (
-            exists(self.atom_permutation_alignment)
-            and exists(additional_molecule_feats)
-            and exists(molecule_atom_perms)
-            and single_structure_input
-        ):
-            if verbose:
-                logger.info("Running atom permutation alignment within EDM")
-
-            try:
-                denoised_atom_pos, _ = self.atom_permutation_alignment(
-                    pred_coords=denoised_atom_pos,
-                    true_coords=atom_pos_ground_truth,  # NOTE: we intentionally use the unaugmented ground truth here
-                    additional_molecule_feats=additional_molecule_feats,
-                    molecule_atom_lens=molecule_atom_lens,
-                    molecule_atom_perms=molecule_atom_perms,
-                    mask=atom_mask,
-                    permute_labels=False,
-                )
-            except Exception as e:
-                # NOTE: For many (random) unit test inputs, permutation alignment can be unstable
-                logger.warning(
-                    f"Skipping atom permutation alignment {f'for {filepath}' if exists(filepath) else ''} due to: {e}"
-                )
-
-        return denoised_atom_pos, aug_atom_pos_aligned, align_weights, loss_weights
-
-
-# elucidated flow model adapted for atom position diffusing
-# inspired by Morehead et al.
-# https://arxiv.org/abs/2412.10966
-
-
-class ElucidatedAtomFlow(Module):
-    """An ElucidatedAtomFlow module."""
-
-    @typecheck
-    def __init__(
-        self,
-        net: DiffusionModule,
-        *,
-        num_sample_steps=40,  # number of sampling steps
-        sigma_data=16.0,  # standard deviation of data distribution
-        diffusion_num_augmentations=48,
-        diffusion_chunk_size=4,
-        stochastic_frame_average=False,
-        augment_during_sampling=True,
-        atom_permutation_alignment_kwargs: dict = dict(
-            run_checker=False,
-            eps=1e-8,
-        ),
-        centre_random_augmentation_kwargs: dict = dict(),
-        atom_permutation_alignment=True,
-        verbose=False,
-        **kwargs,
-    ):
-        super().__init__()
-
-        self.verbose = verbose
-        self.net = net
-
-        # parameters
-
-        self.prior_type = kwargs.get("prior_type")
-        assert self.prior_type in ("flow_gaussian", "flow_harmonic"), (
-            f"Prior type {self.prior_type} not supported for EDM. "
-            "Supported prior types are 'flow_gaussian' and 'flow_harmonic'."
-        )
-
-        self.sigma_data = sigma_data
-
-        self.num_sample_steps = num_sample_steps  # otherwise known as N in the paper
-
-        # augmentation
-
-        self.diffusion_num_augmentations = diffusion_num_augmentations
-        self.diffusion_chunk_size = diffusion_chunk_size
-        self.augment_during_sampling = augment_during_sampling
-
-        self.centre_random_augmenter = CentreRandomAugmentation(
-            **centre_random_augmentation_kwargs
-        )
-
-        # stochastic frame averaging
-        # https://arxiv.org/abs/2305.05577
-
-        self.stochastic_frame_average = stochastic_frame_average
-
-        if stochastic_frame_average:
-            self.frame_average = FrameAverage(
-                dim=3, stochastic=True, return_stochastic_as_augmented_pos=True
-            )
-
-        # permutation alignment
-
-        self.atom_permutation_alignment = None
-
-        if atom_permutation_alignment:
-            self.atom_permutation_alignment = AtomPermutationAlignment(
-                **atom_permutation_alignment_kwargs,
-            )
-
-        self.register_buffer("zero", torch.tensor(0.0), persistent=False)
-
-    @property
-    def device(self):
-        """Return the device of the module.
-
-        :return: The device of the module.
-        """
-        return next(self.net.parameters()).device
-
-    @property
-    def dtype(self):
-        """Return the dtype of the module.
-
-        :return: The dtype of the module.
-        """
-        return next(self.net.parameters()).dtype
-
-    # preconditioned network output
-
-    @typecheck
-    def preconditioned_network_forward(
-        self,
-        noised_atom_pos: Float["b m 3"],  # type: ignore
-        times: Float[" b"] | Float[" "] | float,  # type: ignore
-        network_condition_kwargs: dict,
-        **kwargs,
-    ):
-        """Run a network forward pass, with the preconditioned inputs.
-
-        :param noised_atom_pos: The noised atom position tensor.
-        :param times: The time values.
-        :param network_condition_kwargs: The network condition keyword arguments.
-        :param kwargs: Additional keyword arguments for the attention computation.
-        :return: The output tensor.
-        """
-        batch, dtype, device = (
-            noised_atom_pos.shape[0],
-            noised_atom_pos.dtype,
-            noised_atom_pos.device,
-        )
-
-        if isinstance(times, float):
-            times = torch.full((batch,), times, dtype=dtype, device=device)
-
-        net_out = self.net(
-            noised_atom_pos,
-            times=times,
-            **network_condition_kwargs,
-            **kwargs,
-        )
-
-        out = noised_atom_pos + net_out
-
-        return out
-
-    # sampling
-
-    # sample schedule
-
-    def sample_schedule(self, num_sample_steps=None, start_time: float = 1.0):
-        """Return the schedule of timestep indices for sampling.
-
-        :param num_sample_steps: The number of sample steps.
-        :param start_time: The start time.
-        :return: The schedule of timestep indices for sampling.
-        """
-        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
-
-        schedule = torch.linspace(start_time, 0, num_sample_steps + 1, device=self.device)
-
-        return schedule
-
-    @torch.no_grad()
-    def sample(
-        self,
-        atom_mask: Bool["b m"] | None = None,  # type: ignore
-        num_sample_steps=None,
-        use_tqdm_pbar=True,
-        tqdm_pbar_title="Sampling time step",
-        return_all_timesteps=False,
-        use_optimized_evo=None,
-        umeyama_correction=True,
-        eta: float = 1.0,
-        **network_condition_kwargs,
-    ) -> Float["b m 3"] | Float["ts b m 3"]:  # type: ignore
-        """Sample clean atom positions.
-
-        :param atom_mask: The atom mask tensor.
-        :param num_sample_steps: The number of sample steps.
-        :param network_condition_kwargs: The network condition keyword arguments.
-        :param use_tqdm_pbar: Whether to use tqdm progress bar.
-        :param tqdm_pbar_title: The tqdm progress bar title.
-        :param return_all_timesteps: Whether to return all timesteps.
-        :param use_optimized_evo: Whether to use an optimized Evoformer kernel.
-        :param umeyama_correction: Whether to employ Kabsch-Umeyama correction to align denoised
-            structures to their previous (input) timestep versions to get consistent sampling
-            trajectories.
-        :param eta: The eta value for the VD-ODE solver.
-        :return: The clean atom positions.
-        """
-        dtype = self.dtype
-
-        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
-
-        shape = (*atom_mask.shape, 3)
-
-        network_condition_kwargs.update(atom_mask=atom_mask)
-
-        # get the schedule, which is returned as (t, s) tuple, and pair up with the next t and s
-
-        times = self.sample_schedule(num_sample_steps)
-
-        t_and_s = list(zip(times[:-1], times[1:]))
-
-        # atom position is noise at the beginning
-
-        init_time = times[0]
-
-        if self.prior_type == "flow_gaussian":
-            _, atom_pos = self.gaussian_noise_distribution(
-                batch_size=shape[0],
-                aug_atom_pos=torch.zeros(shape, dtype=dtype, device=self.device),
-                atom_mask=atom_mask,
-                t=init_time,
-                umeyama_correction=umeyama_correction,
-                return_orig_noise=True,
-            )
-        elif self.prior_type == "flow_harmonic":
-            molecule_atom_lens = network_condition_kwargs.get("molecule_atom_lens")
-            is_molecule_types = network_condition_kwargs.get("is_molecule_types")
-            additional_molecule_feats = network_condition_kwargs.get("additional_molecule_feats")
-
-            assert exists(
-                molecule_atom_lens
-            ), "Molecule atom lengths must be provided for harmonic prior sampling."
-            assert exists(
-                is_molecule_types
-            ), "Molecule types must be provided for harmonic prior sampling."
-            assert exists(
-                additional_molecule_feats
-            ), "Additional molecule features must be provided for harmonic prior sampling."
-
-            _, atom_pos = self.harmonic_noise_distribution(
-                batch_size=shape[0],
-                aug_atom_pos=torch.zeros(shape, dtype=dtype, device=self.device),
-                molecule_atom_lens=molecule_atom_lens,
-                is_molecule_types=is_molecule_types,
-                additional_molecule_feats=additional_molecule_feats,
-                atom_mask=atom_mask,
-                t=init_time,
-                umeyama_correction=umeyama_correction,
-                return_orig_noise=True,
-            )
-        else:
-            raise ValueError(f"Prior type {self.prior_type} not supported.")
-
-        # gradually denoise
-
-        maybe_tqdm_wrapper = tqdm if use_tqdm_pbar else identity
-
-        maybe_augment_fn = (
-            self.centre_random_augmenter if self.augment_during_sampling else identity
-        )
-
-        all_atom_pos = [atom_pos]
-
-        for t, s in maybe_tqdm_wrapper(t_and_s, desc=tqdm_pbar_title):
-            t, s = tuple(t.unsqueeze(-1) for t in (t, s))
-
-            atom_pos = maybe_augment_fn(atom_pos.float()).type(dtype)
-
-            model_output = self.preconditioned_network_forward(
-                atom_pos,
-                t,
-                network_condition_kwargs=network_condition_kwargs,
-                use_optimized_evo=use_optimized_evo,
-            )
-
-            if umeyama_correction:
-                try:
-                    model_output = weighted_rigid_align(
-                        # NOTE: `weighted_rigid_align` returns the input-aligned model output
-                        atom_pos,
-                        model_output,
-                        mask=atom_mask,
-                    )
-                except Exception as e:
-                    logger.warning(f"Umeyama correction failed with error {e}. Skipping...")
-
-            # interpolate with a VD-ODE solver
-
-            atom_pos_next = (
-                clamp_tensor(1 - ((s / t) * eta)) * model_output
-                + clamp_tensor((s / t) * eta) * atom_pos
-            )
-
-            atom_pos = atom_pos_next
-
-            all_atom_pos.append(atom_pos)
-
-        # if returning atom positions across all timesteps for visualization
-        # then stack the `all_atom_pos`
-
-        if return_all_timesteps:
-            atom_pos = torch.stack(all_atom_pos)
-
-        return atom_pos
-
-    # training
-
-    @typecheck
-    def loss_weight(self) -> Float["b 1 1"]:  # type: ignore
-        """Return the loss weight for training.
-
-        NOTE: We keep the loss weighting time-independent since `sigma` is constant
-        for all flow matching prior distributions currently (where relevant).
-
-        :return: The loss weight for training.
-        """
-        return 1.0
-
-    @typecheck
-    def gaussian_noise_distribution(
-        self,
-        batch_size: int,
-        aug_atom_pos: Float["b m 3"],  # type: ignore
-        atom_mask: Bool["b m"] | None = None,  # type: ignore
-        t: Float[" b"] | None = None,  # type: ignore
-        sigma_atom_pos: float = 1e-3,
-        umeyama_correction: bool = True,
-        return_orig_noise: bool = False,
-    ) -> Tuple[Float[" b"], Float["b m 3"]]:  # type: ignore
-        """Sample Gaussian-distributed noise.
-
-        NOTE: This function adds small amounts of Gaussian noise
-        to the ground-truth coordinates, to discourage the model
-        from overfitting to experimental noise in the training data.
-        Reference: https://www.science.org/doi/10.1126/science.add2187
-
-        :param batch_size: The batch size.
-        :param aug_atom_pos: The augmented atom positions.
-        :param atom_mask: The atom mask tensor.
-        :param t: The optional time values.
-        :param sigma_atom_pos: The standard deviation of the atom position noise to add.
-        :param umeyama_correction: Whether to employ Kabsch-Umeyama correction to align
-            noise to its crystal structure counterpart.
-        :param return_orig_noise: Whether to return the original noise.
-        :return: The time values and noised atom positions.
-        """
-        dtype = aug_atom_pos.dtype
-
-        t = default(t, torch.rand((batch_size,), device=self.device, dtype=dtype))
-        noise = torch.randn_like(aug_atom_pos) * self.sigma_data
-
-        if return_orig_noise:
-            return t, noise
-
-        noisy_aug_atom_pos = aug_atom_pos + torch.randn_like(aug_atom_pos) * sigma_atom_pos
-
-        if umeyama_correction:
-            try:
-                noise = weighted_rigid_align(
-                    # NOTE: `weighted_rigid_align` returns the atom positions-aligned noise
-                    noisy_aug_atom_pos,
-                    noise,
-                    mask=atom_mask,
-                )
-            except Exception as e:
-                logger.warning(f"Umeyama correction failed with error {e}. Skipping...")
-
-        noise_t = (1 - t[..., None, None]) * noisy_aug_atom_pos + t[..., None, None] * noise
-
-        return t, noise_t
-
-    @typecheck
-    def harmonic_noise_distribution(
-        self,
-        batch_size: int,
-        aug_atom_pos: Float["b m 3"],  # type: ignore
-        molecule_atom_lens: Int["b n"],  # type: ignore
-        is_molecule_types: Bool[f"b n {IS_MOLECULE_TYPES}"],  # type: ignore
-        additional_molecule_feats: Int[f"b n {ADDITIONAL_MOLECULE_FEATS}"],  # type: ignore
-        atom_mask: Bool["b m"] | None = None,  # type: ignore
-        t: Float[" b"] | None = None,  # type: ignore
-        sigma_atom_pos: float = 1e-3,
-        umeyama_correction: bool = True,
-        return_orig_noise: bool = False,
-    ) -> Tuple[Float[" b"], Float["b m 3"]]:  # type: ignore
-        """Sample harmonic-distributed noise.
-
-        NOTE: This function adds small amounts of Gaussian noise
-        to the ground-truth coordinates, to discourage the model
-        from overfitting to experimental noise in the training data.
-        Reference: https://www.science.org/doi/10.1126/science.add2187
-
-        :param batch_size: The batch size.
-        :param aug_atom_pos: The augmented atom positions.
-        :param molecule_atom_lens: The molecule atom lengths tensor.
-        :param is_molecule_types: The molecule types tensor.
-        :param additional_molecule_feats: The additional molecule features tensor.
-        :param atom_mask: The atom mask tensor.
-        :param t: The optional time values.
-        :param sigma_atom_pos: The standard deviation of the atom position noise to add.
-        :param umeyama_correction: Whether to employ Kabsch-Umeyama correction to align
-            noise to its crystal structure counterpart.
-        :param return_orig_noise: Whether to return the original noise.
-        :return: The time values and noised atom positions.
-        """
-        dtype = aug_atom_pos.dtype
-
-        t = default(t, torch.rand((batch_size,), device=self.device, dtype=dtype))
-
-        noise = sample_harmonic_prior(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=dtype,
-            molecule_atom_lens=molecule_atom_lens,
-            is_molecule_types=is_molecule_types,
-            additional_molecule_feats=additional_molecule_feats,
-        )
-        assert (
-            noise.shape == aug_atom_pos.shape
-        ), f"Harmonic noise shape {noise.shape} does not match atom position shape {aug_atom_pos.shape}."
-
-        if return_orig_noise:
-            return t, noise
-
-        noisy_aug_atom_pos = aug_atom_pos + torch.randn_like(aug_atom_pos) * sigma_atom_pos
-
-        if umeyama_correction:
-            try:
-                noise = weighted_rigid_align(
-                    # NOTE: `weighted_rigid_align` returns the atom positions-aligned noise
-                    noisy_aug_atom_pos,
-                    noise,
-                    mask=atom_mask,
-                )
-            except Exception as e:
-                logger.warning(f"Umeyama correction failed with error {e}. Skipping...")
-
-        noise_t = (1 - t[..., None, None]) * noisy_aug_atom_pos + t[..., None, None] * noise
-
-        return t, noise_t
-
-    @typecheck
-    def forward(
-        self,
-        atom_pos_ground_truth: Float["b m 3"],  # type: ignore
-        atom_mask: Bool["b m"],  # type: ignore
-        atom_feats: Float["b m da"],  # type: ignore
-        atompair_feats: Float["b m m dap"] | Float["b nw w (w*2) dap"],  # type: ignore
-        mask: Bool["b n"],  # type: ignore
-        single_trunk_repr: Float["b n dst"],  # type: ignore
-        single_inputs_repr: Float["b n dsi"],  # type: ignore
-        pairwise_trunk: Float["b n n dpt"],  # type: ignore
-        pairwise_rel_pos_feats: Float["b n n dpr"],  # type: ignore
-        molecule_atom_lens: Int["b n"],  # type: ignore
-        missing_atom_mask: Bool["b m"] | None = None,  # type: ignore
-        atom_parent_ids: Int["b m"] | None = None,  # type: ignore
-        is_molecule_types: Bool[f"b n {IS_MOLECULE_TYPES}"] | None = None,  # type: ignore
-        additional_molecule_feats: Int[f"b n {ADDITIONAL_MOLECULE_FEATS}"] | None = None,  # type: ignore
-        nucleotide_loss_weight=5.0,
-        ligand_loss_weight=10.0,
-        single_structure_input=False,
-        use_optimized_evo=None,
-        verbose=None,
-        filepath: List[str] | Tuple[str, ...] | None = None,
-        molecule_atom_perms: List[List[List[int]]] | None = None,
-    ) -> Tuple[
-        Float["ba m 3"],  # type: ignore
-        Float["ba m 3"],  # type: ignore
-        Float["ba m"],  # type: ignore
-        Float["ba 1 1"],  # type: ignore
-    ]:
-        """Perform the forward pass.
-
-        :param atom_pos_ground_truth: The ground truth atom position tensor.
-        :param atom_mask: The atom mask tensor.
-        :param atom_feats: The atom features tensor.
-        :param atompair_feats: The atom pair features tensor.
-        :param mask: The mask tensor.
-        :param single_trunk_repr: The single trunk representation tensor.
-        :param single_inputs_repr: The single inputs representation tensor.
-        :param pairwise_trunk: The pairwise trunk tensor.
-        :param pairwise_rel_pos_feats: The pairwise relative position features tensor.
-        :param molecule_atom_lens: The molecule atom lengths tensor.
-        :param token_bonds: The token bonds tensor.
-        :param molecule_atom_indices: The molecule atom indices tensor.
-        :param missing_atom_mask: The missing atom mask tensor.
-        :param atom_parent_ids: The atom parent IDs tensor.
-        :param is_molecule_types: The molecule types tensor.
-        :param additional_molecule_feats: The additional molecule features tensor.
-        :param add_smooth_lddt_loss: Whether to add the smooth lddt loss.
-        :param add_bond_loss: Whether to add the bond loss.
-        :param nucleotide_loss_weight: The nucleotide loss weight.
-        :param ligand_loss_weight: The ligand loss weight.
-        :param single_structure_input: Whether to the input(s) represent a single structure.
-        :param use_optimized_evo: Whether to use an optimized Evoformer kernel.
-        :param verbose: Whether to be verbose.
-        :param filepath: The input filepath(s).
-        :param molecule_atom_perms: The molecule atom permutations.
-        :return: The denoised atom positions, augmented atom positions, alignment weights, and loss
-            weights.
-        """
-        verbose = default(verbose, self.verbose)
-
-        dtype = atom_pos_ground_truth.dtype
-        batch_size = atom_pos_ground_truth.shape[0]
-
-        # augmentations
-
-        with torch.no_grad():
-            num_augs = self.diffusion_num_augmentations + int(self.stochastic_frame_average)
-            diffusion_chunk_size = default(self.diffusion_chunk_size, num_augs)
-            aug_atom_pos = repeat(atom_pos_ground_truth, "b ... -> (b a) ...", a=num_augs)
-
-            # center the ground truth coordinates while accounting for masking
-
-            num = reduce(aug_atom_pos * atom_mask[..., None], "b n c -> b c", "sum")
-            den = reduce(atom_mask.float(), "b n -> b", "sum")
-            aug_atom_pos_mean = num[..., None, :] / den[..., None, None].clamp(min=1.0)
-
-            aug_atom_pos = (aug_atom_pos - aug_atom_pos_mean) * atom_mask[..., None]
-
-            # handle stochastic frame averaging
-
-            if self.stochastic_frame_average:
-                if verbose:
-                    logger.info("Applying stochastic frame averaging...")
-
-                fa_atom_pos, aug_atom_pos = aug_atom_pos[:1], aug_atom_pos[1:]
-
-                fa_atom_pos = self.frame_average(
-                    fa_atom_pos.float(), frame_average_mask=atom_mask
-                ).type(dtype)
-
-                fa_atom_pos = fa_atom_pos * atom_mask[..., None]
-
-            # normal random augmentations, 48 times in the AF3 paper
-
-            if verbose:
-                logger.info("Applying random augmentations...")
-
-            aug_atom_pos = self.centre_random_augmenter(aug_atom_pos.float(), mask=atom_mask).type(
-                dtype
-            )
-
-            # concat back the stochastic frame averaged position
-
-            if self.stochastic_frame_average:
-                aug_atom_pos = torch.cat((fa_atom_pos, aug_atom_pos), dim=0)
-
-        # flow loss
-
-        if self.prior_type == "flow_gaussian":
-            times, noise = self.gaussian_noise_distribution(
-                batch_size=batch_size * num_augs,
-                aug_atom_pos=aug_atom_pos,
-                atom_mask=atom_mask,
-            )
-        elif self.prior_type == "flow_harmonic":
-            times, noise = self.harmonic_noise_distribution(
-                batch_size=batch_size * num_augs,
-                aug_atom_pos=aug_atom_pos,
-                molecule_atom_lens=molecule_atom_lens,
-                is_molecule_types=is_molecule_types,
-                additional_molecule_feats=additional_molecule_feats,
-                atom_mask=atom_mask,
-            )
-        else:
-            raise ValueError(f"Prior type {self.prior_type} not supported for EDM.")
-
-        # loss weight
-
-        loss_weight_fn = self.loss_weight
-        loss_weights = loss_weight_fn()
-
-        if verbose:
-            logger.info("Running preconditioned network forward pass within EDM")
-
-        denoised_atom_pos = []
-        num_aug_chunks = num_augs // diffusion_chunk_size + (num_augs % diffusion_chunk_size != 0)
-        for i in range(num_aug_chunks):
-            # NOTE: `alphas` are `1.0` in the AF3 paper
-            noised_atom_pos_i = noise[
-                ..., i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size, :, :
-            ]
-            times_i = times[..., i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size]
-
-            diffusion_chunk_size_ = len(times_i)
-            mask_i = mask.expand(diffusion_chunk_size // batch_size, -1)[
-                :diffusion_chunk_size_, ...
-            ]
-
-            denoised_atom_pos_i = self.preconditioned_network_forward(
-                noised_atom_pos_i,
-                times_i,
                 network_condition_kwargs=dict(
                     atom_feats=atom_feats,
                     atom_mask=atom_mask,
@@ -5802,6 +5065,7 @@ class InputFeatureEmbedder(Module):
             atompair_feats = full_pairwise_repr_to_windowed(atompair_feats, window_size=w)
 
         # condition atompair with atom repr
+        # print("atom_feats: (K,N)=(128,32)", atom_feats.shape)
         atom_feats_cond = self.atom_repr_to_atompair_feat_cond(atom_feats)
 
         atom_feats_cond = pad_and_window(atom_feats_cond, w)
@@ -6242,9 +5506,11 @@ class ConfidenceHead(Module):
 
         # NOTE: Protenix introduces new weights instead as follows:
 
+        # print("single_repr: (K,N)=(384,384)", single_repr.shape)
         # single_repr = self.single_repr_embed(self.single_repr_norm(single_repr)) + self.single_inputs_embed(single_inputs_repr)
         single_repr = self.single_repr_embed(single_repr) + self.single_inputs_embed(single_inputs_repr)
         
+        # print("pairwise_repr: (K,N)=(128,128)", pairwise_repr.shape)
         # pairwise_repr = self.pairwise_repr_embed(self.pairwise_repr_norm(pairwise_repr)) + self.single_inputs_to_pairwise(single_inputs_repr)
         pairwise_repr = self.pairwise_repr_embed(pairwise_repr) + self.single_inputs_to_pairwise(single_inputs_repr)
 
@@ -8113,7 +7379,7 @@ class MegaFold(Module):
         loss_confidence_weight=1e-4,
         loss_distogram_weight=1e-2,
         loss_diffusion_weight=4.0,
-        prior_type: Literal["diffusion", "flow_gaussian", "flow_harmonic"] = "diffusion",
+        prior_type: Literal["diffusion"] = "diffusion",
         multi_chain_permutation_alignment: bool = True,
         atom_permutation_alignment: bool = True,
         input_embedder_kwargs: dict = dict(
@@ -8231,9 +7497,6 @@ class MegaFold(Module):
         if verbose and exists(use_optimized_evo) and use_optimized_evo == "triton":
             logger.info("Using Triton's optimized Evoformer kernel.")
 
-        if verbose and use_tempo_layernorm:
-            logger.info("Using Tempo's optimized InplaceLayerNorm implementation.")
-
         # select attention implementation
 
         self.use_optimized_evo = use_optimized_evo
@@ -8245,7 +7508,7 @@ class MegaFold(Module):
         # choose layer normalization type globally
 
         global LayerNorm
-        LayerNorm = nn.LayerNorm # InplaceLayerNorm if use_tempo_layernorm else nn.LayerNorm
+        LayerNorm = nn.LayerNorm
 
         # store atom and atompair input dimensions for shape validation
 
@@ -8439,13 +7702,9 @@ class MegaFold(Module):
         # )
         self.recycle_pairwise = LayernormLinear(dim_pairwise, dim_pairwise, has_linear_bias=False)
 
-        # diffusion or flow matching
-
-        flow = prior_type in ("flow_gaussian", "flow_harmonic")
-
-        edm_class = (
-            partial(ElucidatedAtomFlow, prior_type=prior_type) if flow else ElucidatedAtomDiffusion
-        )
+        # diffusion 
+        
+        edm_class = ElucidatedAtomDiffusion
 
         self.diffusion_module = DiffusionModule(
             dim_pairwise_trunk=dim_pairwise,
@@ -8458,7 +7717,6 @@ class MegaFold(Module):
             dim_token=dim_token,
             dim_single=dim_single + dim_single_inputs,
             checkpoint=checkpoint_diffusion_module,
-            flow=flow,
             **diffusion_module_kwargs,
         )
 
@@ -8602,11 +7860,6 @@ class MegaFold(Module):
         self.dtf = dim_additional_token_feats
         self.dmi = dim_msa_inputs
         self.num_mods = num_molecule_mods
-        
-        self.msamodule_time = [] 
-        self.templateembedder_time = [] 
-        self.pairformer_time = [] 
-        self.diffusionmodule_time = []
 
     @property
     def device(self):
@@ -9117,10 +8370,12 @@ class MegaFold(Module):
 
             if exists(single):
                 single = maybe_recycling_detach(single) 
+                # print("single: (K,N)=(384, 384)", single.shape)
                 recycled_single = self.recycle_single(single)
 
             if exists(pairwise):
                 pairwise = maybe_recycling_detach(pairwise)
+                # print("pairwise: (K,N)=(128,128)", pairwise.shape)
                 recycled_pairwise = self.recycle_pairwise(pairwise)
 
             single = single_init + recycled_single
@@ -9153,8 +8408,7 @@ class MegaFold(Module):
                 template_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=self.device)
 
             # ensure template embedder always contributes to the loss
-            self.print(f"Memory usage before templateembedder: {SynchronizedWallClockTimer.memory_usage()}")
-            template_embedder_start = time.time() 
+
             embedded_template = self.template_embedder(
                 templates=templates,
                 template_mask=template_mask,
@@ -9162,9 +8416,6 @@ class MegaFold(Module):
                 mask=mask,
                 use_optimized_evo=use_optimized_evo,
             )
-            self.templateembedder_time.append(time.time() - template_embedder_start)
-            self.print(f"Time taken template embedder: {time.time() - template_embedder_start}")
-            self.print(f"Memory usage after templateembedder: {SynchronizedWallClockTimer.memory_usage()}")
 
             pairwise = embedded_template + pairwise
 
@@ -9185,8 +8436,6 @@ class MegaFold(Module):
                     )
                     msa_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=self.device)
 
-            self.print(f"Memory usage before msamodule: {SynchronizedWallClockTimer.memory_usage()}")
-            msa_module_start = time.time()
             embedded_msa = self.msa_module(
                 msa=msa,
                 single_repr=single_inputs,
@@ -9196,9 +8445,6 @@ class MegaFold(Module):
                 mask=mask,
                 use_optimized_evo=use_optimized_evo,
             )
-            self.msamodule_time.append(time.time() - msa_module_start)
-            self.print(f"Time taken msa module: {time.time() - msa_module_start}")
-            self.print(f"Memory usage after msamodule: {SynchronizedWallClockTimer.memory_usage()}")
 
             pairwise = embedded_msa + pairwise
 
@@ -9207,17 +8453,12 @@ class MegaFold(Module):
             if verbose:
                 logger.info(f"Applying pairformer in recycling step {i}...")
 
-            self.print(f"Memory usage before pairformer: {SynchronizedWallClockTimer.memory_usage()}")
-            pairformer_start = time.time() 
             single, pairwise = self.pairformer(
                 single_repr=single,
                 pairwise_repr=pairwise,
                 mask=mask,
                 use_optimized_evo=use_optimized_evo,
             )
-            self.pairformer_time.append(time.time() - pairformer_start)
-            self.print(f"Time taken pairformer: {time.time() - pairformer_start}")
-            self.print(f"Memory usage after pairformer: {SynchronizedWallClockTimer.memory_usage()}")
 
             # ensure the recycling weights are always in the computational graph
 
@@ -9752,8 +8993,7 @@ class MegaFold(Module):
                 )
 
             # diffusion module
-            self.print(f"Memory usage before diffusion module: {SynchronizedWallClockTimer.memory_usage()}")
-            dm_start = time.time() 
+
             if self.train_structure_and_distogram:
                 if verbose:
                     logger.info("Calculating diffusion predictions...")
@@ -9786,9 +9026,6 @@ class MegaFold(Module):
                     use_optimized_evo=use_optimized_evo,
                     verbose=verbose,
                 )
-            self.diffusionmodule_time.append(time.time() - dm_start)
-            self.print(f"Time taken diffusionmodule: {time.time() - dm_start}")
-            self.print(f"Memory usage after diffusion module: {SynchronizedWallClockTimer.memory_usage()}")
 
             # confidence head
 
@@ -9983,19 +9220,11 @@ class MegaFold(Module):
                 valid_distogram_mask=valid_distogram_mask,
                 valid_molecule_atom_mask=valid_molecule_atom_mask,
             )
-            self.print(f"MSAModule forward time over the steps: {self.msamodule_time}")
-            self.print(f"TemplateEmbedder forward time over the steps: {self.templateembedder_time}")
-            self.print(f"Pairformer forward time over the steps: {self.pairformer_time}")
-            self.print(f"DiffusionModule forward time over the steps: {self.diffusionmodule_time}")
-            self.print(f"Memory usage after fwd pass: {SynchronizedWallClockTimer.memory_usage()}")
-            
+
             if not return_loss_breakdown:
                 return loss
 
-            return loss, loss_breakdown    
-    def print(self, *args, **kwargs):
-        if dist.get_rank() == 0:
-            print(*args, **kwargs)
+            return loss, loss_breakdown
 
 
 # an megafold that can download pretrained weights from huggingface

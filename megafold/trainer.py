@@ -4,7 +4,7 @@ import glob
 import os
 import pprint
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
@@ -30,7 +30,7 @@ from torch.utils.data import Dataset, Sampler
 from torchmetrics.aggregation import MeanMetric
 from tqdm import tqdm
 from wrapt_timeout_decorator import timeout
-
+from torch.utils.data.distributed import DistributedSampler
 from megafold.data import mmcif_writing
 from megafold.inputs import (
     BatchedAtomInput,
@@ -38,7 +38,6 @@ from megafold.inputs import (
     compose_calls,
 )
 from megafold.model.megafold import ComputeConfidenceScore, ComputeModelSelectionScore, Sample
-    
 from megafold.tensor_typing import package_available, should_typecheck, typecheck
 from megafold.utils.model_utils import at_most_one_of, divisible_by
 from megafold.utils.trainer_utils import (
@@ -52,9 +51,29 @@ from megafold.utils.trainer_utils import (
     parse_dtype,
 )
 from megafold.utils.utils import default, exists, not_exists
+from megafold.distributed.parallel_info import setup_2d_parallel_groups, get_parallel_info
 import time 
 from deepspeed.utils.timer import SynchronizedWallClockTimer
+import torch.distributed as dist
+from datetime import timedelta
+import deepspeed
+import random
+import numpy as np
 
+
+def seed_everything(seed: int):
+    """
+    Seed all random number generators for reproducibility.
+    Replicates Lightning Fabric's seed_everything() behavior.
+    
+    Args:
+        seed: Random seed value
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU
 
 
 # constants
@@ -62,6 +81,66 @@ from deepspeed.utils.timer import SynchronizedWallClockTimer
 PHASES = Literal["train", "val", "test"]
 FORWARD_MAX_SECONDS_PER_INPUT = 120
 SAMPLING_MAX_SECONDS_PER_INPUT = 300
+
+
+# =================================================================================
+# === 2D Parallelism Setup =======================================================
+# =================================================================================
+
+
+def create_2d_dataloader(dataset, batch_size, parallel_info, DataLoader_, is_training=True, **kwargs):
+    """
+    Create dataloader for 2D parallelism.
+    
+    Key insight: Since ranks within the same SP group have the same ddp_rank,
+    DistributedSampler automatically gives them identical data samples.
+    
+    Args:
+        dataset: The dataset to wrap
+        batch_size: Batch size per GPU
+        parallel_info: 2D parallel configuration info
+        DataLoader_: Custom DataLoader class (with preprocessing logic)
+        is_training: Whether this is a training dataloader (affects sampler behavior)
+        **kwargs: Additional dataloader arguments
+    """
+    # Handle sampler logic exactly like original code
+    dataloader_kwargs = dict(kwargs)
+    
+    if 'sampler' in dataloader_kwargs:
+        # Custom sampler provided - use it but warn about potential conflicts
+        # Note: This case is rare and may need special handling
+        print("Warning: Custom sampler provided with 2D parallelism. This may conflict with DistributedSampler.")
+        pass
+    else:
+        # Create DistributedSampler for 2D parallelism
+        # Use shuffle from kwargs (True for training, False for val/test)
+        shuffle_data = dataloader_kwargs.pop('shuffle', False) if is_training else False
+        
+        # For SP groups that should see the same data, use SP-based sampling
+        # This ensures consistent data ordering across different SP configurations
+        if parallel_info['ddp_size'] == 1:
+            # Single SP group case: all ranks see all data (no distributed sampling)
+            sampler = None  # Use default sequential sampler
+            dataloader_kwargs['shuffle'] = shuffle_data  # Restore shuffle for non-distributed case
+        else:
+            # Multiple SP groups case: use DDP-based sampling
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=parallel_info['ddp_size'],  # Number of DDP groups
+                rank=parallel_info['ddp_rank'],          # DDP rank
+                shuffle=shuffle_data
+            )
+            dataloader_kwargs['sampler'] = sampler
+        
+        # Remove shuffle from kwargs only if we're using a sampler
+        if sampler is not None:
+            dataloader_kwargs.pop('shuffle', None)
+    
+    return DataLoader_(
+        dataset,
+        batch_size=batch_size,
+        **dataloader_kwargs
+    )
 
 
 # helpers
@@ -165,7 +244,7 @@ class Trainer:
         scheduler: LRScheduler | None = None,
         ema_decay: float = 0.999,
         lr: float = 1e-3,
-        default_adam_kwargs: dict = dict(
+        default_optimizer_kwargs: dict = dict(
             betas=(0.9, 0.95),
             eps=1e-8,
         ),
@@ -179,7 +258,9 @@ class Trainer:
         logger_kwargs: dict = dict(),
         train_log_interval: int = 1,
         accelerator: Literal["cpu", "gpu", "tpu", "mps", "auto"] = "auto",
-        strategy: Literal["auto", "ddp", "deepspeed"] = "ddp",
+        strategy: Literal["auto", "ddp", "deepspeed", "deepspeed_2d"] = "deepspeed_2d",
+        data_parallel_size: int = 1,
+        sequence_parallel_size: int = 1,
         strategy_stage: int = 0,
         checkpoint_prefix: str = "megafold.ckpt.",
         checkpoint_every: int = 25,
@@ -207,7 +288,11 @@ class Trainer:
 
         # precision
 
-        self.dtype = parse_dtype(precision or get_default_supported_precision(training=True))
+        self.precision_str = precision or get_default_supported_precision(training=True) # bf16-mixed
+        self.dtype = parse_dtype(self.precision_str) # torch.bfloat16
+
+        # Initialize 2D parallelism flag
+        self.use_native_deepspeed_2d = False
 
         # strategy
 
@@ -232,6 +317,9 @@ class Trainer:
             ds_config["gradient_accumulation_steps"] = grad_accum_every
 
             strategy = DeepSpeedStrategy(config=ds_config)
+        elif strategy == "deepspeed_2d":
+            # Use native DeepSpeed with 2D parallelism (no Fabric)
+            self.use_native_deepspeed_2d = True
         elif strategy != "auto":
             raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -246,22 +334,45 @@ class Trainer:
 
         self.train_log_interval = train_log_interval
 
-        # fabric
+        # initialize DS/Fabric
 
-        if not_exists(fabric):
-            fabric = Fabric(
-                accelerator=accelerator,
-                devices=devices,
-                num_nodes=num_nodes,
-                strategy=strategy,
-                # NOTE: we use 32-bit precision by default to avoid weight casting issues with DeepSpeed
-                precision=precision or "32-true",
-                loggers=loggers,
-                **fabric_kwargs,
-            )
+        if self.use_native_deepspeed_2d:
+            # Skip Fabric setup for native DeepSpeed 2D
+            self.fabric = None
 
-        self.fabric = fabric
-        self.fabric.launch()
+            # Set device early to avoid NCCL warnings
+            # For multi-node: LOCAL_RANK should be 0-7 on each node, not global rank
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            # Ensure local_rank is within valid GPU range (0-7 per node)
+            num_gpus_per_node = torch.cuda.device_count()
+            local_rank = local_rank % num_gpus_per_node
+            torch.cuda.set_device(local_rank)
+            
+            # Ensure all new groups created (by us or libraries) inherit a long default timeout
+            # Initialize distributed backend with extended timeout
+            if not dist.is_initialized():
+                deepspeed.init_distributed(timeout=timedelta(seconds=120000))
+
+            # Store configuration for later use
+            self.global_batch_size = global_batch_size
+            self.data_parallel_size = data_parallel_size
+            self.sequence_parallel_size = sequence_parallel_size
+            
+        else:
+            if not_exists(fabric):
+                fabric = Fabric(
+                    accelerator=accelerator,
+                    devices=devices,
+                    num_nodes=num_nodes,
+                    strategy=strategy,
+                    # NOTE: we use 32-bit precision by default to avoid weight casting issues with DeepSpeed
+                    precision=precision or "32-true", # "32-true"
+                    loggers=loggers,
+                    **fabric_kwargs,
+                )
+
+            self.fabric = fabric
+            self.fabric.launch()
 
         # dataset arguments
 
@@ -273,9 +384,14 @@ class Trainer:
 
         hparams = capture_hparams()
 
-        self.fabric.print(pprint.pformat(hparams))
-        if logger_name in ("tensorboard", "wandb"):
-            self.fabric.logger.log_hyperparams(hparams)
+        if self.use_native_deepspeed_2d:
+            if dist.get_rank() == 0:
+                print(pprint.pformat(hparams))
+                # TODO: Add hyperparameter logging for 2D mode if needed
+        else:
+            self.fabric.print(pprint.pformat(hparams))
+            if logger_name in ("tensorboard", "wandb"):
+                self.fabric.logger.log_hyperparams(hparams)
 
         # checkpointing logic
 
@@ -301,7 +417,10 @@ class Trainer:
         # this is designed as such to ensure that map-style distillation datasets
         # are directly compatible with the PDBDataset via simple concatenation.
         self.print(f"Seeding everything with seed {seed + latest_step}.")
-        self.fabric.seed_everything(seed + latest_step)
+        if self.use_native_deepspeed_2d:
+            seed_everything(seed + latest_step)
+        else:
+            self.fabric.seed_everything(seed + latest_step)
 
         # PAE-specific loss adjustment
 
@@ -314,8 +433,12 @@ class Trainer:
 
         # efficient model instantiation
 
-        with self.fabric.init_module():
-            model = model.create_instance()  # NOTE: parameters are placed on the meta-device
+        if self.use_native_deepspeed_2d:
+            # Initialize model on CPU for efficient DeepSpeed loading
+            model = model.create_instance()
+        else:
+            with self.fabric.init_module():
+                model = model.create_instance()  # NOTE: parameters are placed on the meta-device
 
         # exponential moving average (EMA)
 
@@ -348,7 +471,10 @@ class Trainer:
 
         # reseed everything (since for some reason model initialization resets `torch.initial_seed()`)
 
-        self.fabric.seed_everything(seed + latest_step)
+        if self.use_native_deepspeed_2d:
+            seed_everything(seed + latest_step)
+        else:
+            self.fabric.seed_everything(seed + latest_step)
 
         # if map dataset function given, curry into DataLoader
 
@@ -363,40 +489,11 @@ class Trainer:
 
         if exists(train_sampler):
             train_dl_kwargs.update(sampler=train_sampler)
+            print("Warning: Custom sampler provided with 2D parallelism. This may conflict with DistributedSampler.") 
         else:
-            train_dl_kwargs.update(shuffle=True, drop_last=True)
-
-        # train dataloader
-
-        self.global_batch_size = global_batch_size
-        self.num_nodes = num_nodes
-
-        self.dataloader = DataLoader_(
-            dataset, batch_size=self.batch_size(), **dl_kwargs, **train_dl_kwargs
-        )
-        dataloaders = [self.dataloader]
-
-        # validation dataloader on the EMA model
-
-        self.valid_every = valid_every
-
-        self.needs_valid = exists(valid_dataset)
-
-        if self.needs_valid:
-            self.valid_dataloader = DataLoader_(
-                valid_dataset, batch_size=self.batch_size(), **dl_kwargs
-            )
-            dataloaders.append(self.valid_dataloader)
-
-        # testing dataloader on EMA model
-
-        self.needs_test = exists(test_dataset)
-
-        if self.needs_test:
-            self.test_dataloader = DataLoader_(
-                test_dataset, batch_size=self.batch_size(), **dl_kwargs
-            )
-            dataloaders.append(self.test_dataloader)
+            # For debugging/comparison purposes, you can set shuffle=False here
+            # Set shuffle=False for reproducible comparison between 1x1GPU and 1x2GPU runs
+            train_dl_kwargs.update(shuffle=False, drop_last=True)
 
         # training, validation, and test steps
 
@@ -416,21 +513,23 @@ class Trainer:
             assert at_most_one_of(use_adam_atan2, use_lion)
 
             if use_adam_atan2:
-                default_adam_kwargs.pop("eps", None)
+                default_optimizer_kwargs.pop("eps", None)
                 optimizer_klass = AdamAtan2
                 assert not (self.using_deepspeed_strategy and offload_optimizer), (
                     "AdamAtan2 is not supported with DeepSpeed optimizer offloading. "
                     "Please set `use_adam_atan2=False` or `offload_optimizer=False`."
                 )
             elif use_lion:
-                default_adam_kwargs.pop("eps", None)
+                default_optimizer_kwargs.pop("eps", None)
                 optimizer_klass = (
                     DeepSpeedCPULion
                     if self.using_deepspeed_strategy and offload_optimizer
                     else Lion
                 )
 
-            optimizer = optimizer_klass(model.parameters(), lr=lr, **default_adam_kwargs)
+            # Remove 'type' key if present (comes from config but not accepted by optimizer)
+            default_optimizer_kwargs.pop("type", None)
+            optimizer = optimizer_klass(model.parameters(), lr=lr, **default_optimizer_kwargs)
 
         elif (
             self.using_deepspeed_strategy
@@ -448,32 +547,141 @@ class Trainer:
         if not_exists(scheduler):
             scheduler = LambdaLR(optimizer, lr_lambda=default_lambda_lr)
 
-        # fabric setup for model and optimizer
-        #print("\n\n\nNumber of trainable params:",  sum(p.numel() for p in model.parameters() if p.requires_grad))
-        #print("\n\n\nNumber of params:",  sum(p.numel() for p in model.parameters()))
-        #print("\n\n\n")
-        #for name, p in model.named_parameters():
-         #   print(name)
+        # setup for model and optimizer
 
-        model, optimizer = self.fabric.setup(model, optimizer)
+        if self.use_native_deepspeed_2d:
+            # DeepSpeed configuration - use external optimizer and scheduler
+            # NOTE: Keep DeepSpeed in 32-bit like Fabric, let model handle mixed precision via autocast
+            # For 2D parallelism: We need to satisfy DeepSpeed's assertion while maintaining correct training.  DeepSpeed assertion: train_batch_size == micro_batch × grad_accum × world_sizeIn 2D parallelism: Only data_parallel_size GPUs process different data. Solution: Set train_batch_size to what DeepSpeed expects based on world_size
+            world_size = dist.get_world_size()
+            deepspeed_train_batch_size = self.batch_size() * grad_accum_every * world_size
+            
+            ds_config = {
+                "train_micro_batch_size_per_gpu": self.batch_size(),
+                "train_batch_size": deepspeed_train_batch_size,
+                "gradient_accumulation_steps": grad_accum_every,
+                "zero_optimization": {"stage": strategy_stage},
+                "gradient_clipping": clip_grad_norm,
+                "bf16": {"enabled": False},  # Let model handle mixed precision like Fabric
+            }
+            
+            # Initialize DeepSpeed engine with user's optimizer and scheduler
+            model_engine, ds_optimizer, _, ds_scheduler = deepspeed.initialize(
+                model=model,
+                model_parameters=model.parameters(),
+                optimizer=optimizer,
+                lr_scheduler=scheduler,
+                config=ds_config
+            )
+            
+            self.model, self.model_optimizer, self.scheduler = model_engine, ds_optimizer, ds_scheduler
+            self.model_engine = model_engine
+            
+            # After DeepSpeed initialization, setup 2D parallelism groups.
+            # This avoids communicator creation races during DS engine bootstrapping.
+            self.parallel_info = setup_2d_parallel_groups(
+                self.data_parallel_size,
+                self.sequence_parallel_size,
+                timeout_seconds=120000,
+            )
+            
+            # Print 2D parallelism info
+            self.print("DeepSpeed 2D Parallelism initialized:")
+            self.print(f"  - Data parallel size: {self.data_parallel_size}")
+            self.print(f"  - Sequence parallel size: {self.sequence_parallel_size}")
+            self.print(f"  - DDP groups: {self.parallel_info['ddp_groups']}")
+            self.print(f"  - SP groups: {self.parallel_info['sp_groups']}")
+            self.print(f"  - DeepSpeed precision: 32-bit (matches Fabric)")
+            self.print(f"  - Model dtype: {self.dtype} (via autocast)")
+            self.print(f"  - Mixed precision: Model-managed via torch.autocast (same as Fabric)")
+            
+        else:
+            # Original Fabric setup
+            model, optimizer = self.fabric.setup(model, optimizer)
+            self.model, self.model_optimizer, self.scheduler = model, optimizer, scheduler
+            self.model_engine = None
 
-        self.model, self.model_optimizer, self.scheduler = model, optimizer, scheduler
+        
+        # dataloaders
+        self.num_nodes = num_nodes
+        self.valid_every = valid_every
+        self.needs_valid = exists(valid_dataset)
+        self.needs_test = exists(test_dataset)
+
+        if self.use_native_deepspeed_2d:
+            # Create dataloaders with 2D parallelism using original logic            
+            # Training dataloader
+            self.dataloader = create_2d_dataloader(
+                dataset, 
+                batch_size=self.batch_size(),
+                parallel_info=self.parallel_info,
+                DataLoader_=DataLoader_,
+                is_training=True,
+                **dl_kwargs, 
+                **train_dl_kwargs
+            )
+            dataloaders = [self.dataloader]
+            
+            # Validation dataloader (no shuffle, no drop_last, no custom sampler)
+            if self.needs_valid:
+                self.valid_dataloader = create_2d_dataloader(
+                    valid_dataset,
+                    batch_size=self.batch_size(),
+                    parallel_info=self.parallel_info,
+                    DataLoader_=DataLoader_,
+                    is_training=False,
+                    **dl_kwargs
+                )
+                dataloaders.append(self.valid_dataloader)
+            
+            # Test dataloader (no shuffle, no drop_last, no custom sampler)
+            if self.needs_test:
+                self.test_dataloader = create_2d_dataloader(
+                    test_dataset,
+                    batch_size=self.batch_size(),
+                    parallel_info=self.parallel_info,
+                    DataLoader_=DataLoader_,
+                    is_training=False,
+                    **dl_kwargs
+                )
+                dataloaders.append(self.test_dataloader)
+        else:
+            # Original dataloader creation
+            self.dataloader = DataLoader_(
+                dataset, batch_size=self.batch_size(), **dl_kwargs, **train_dl_kwargs
+            )
+            dataloaders = [self.dataloader]
+
+            # validation dataloader on the EMA model
+            if self.needs_valid:
+                self.valid_dataloader = DataLoader_(
+                    valid_dataset, batch_size=self.batch_size(), **dl_kwargs
+                )
+                dataloaders.append(self.valid_dataloader)
+
+            # testing dataloader on EMA model
+            if self.needs_test:
+                self.test_dataloader = DataLoader_(
+                    test_dataset, batch_size=self.batch_size(), **dl_kwargs
+                )
+                dataloaders.append(self.test_dataloader)
+
+
+        # setup dataloaders with Fabric (only for non-2D case)
+        if not self.use_native_deepspeed_2d:
+            dataloaders = self.fabric.setup_dataloaders(*dataloaders)
+            
+            # Reassign dataloaders after Fabric setup
+            self.dataloader = dataloaders[0]
+            
+            if self.needs_valid:
+                self.valid_dataloader = dataloaders[1]
+            
+            if self.needs_test:
+                self.test_dataloader = dataloaders[-1]
 
         if self.is_main and summarize_model:
             torchinfo.summary(model)
-
-        # dataloaders
-
-        dataloaders = self.fabric.setup_dataloaders(*dataloaders)
-
-        self.dataloader = dataloaders # [0]
-
-        if self.needs_valid:
-            self.valid_dataloader = dataloaders[1]
-
-        if self.needs_test:
-            self.test_dataloader = dataloaders[-1]
-
         # maximum norm gradient clipping
 
         self.clip_grad_norm = clip_grad_norm
@@ -496,7 +704,10 @@ class Trainer:
 
         # path caching for the last loaded model, if any
 
-        self.train_id = get_logger_experiment_id(self.fabric.loggers)
+        if self.use_native_deepspeed_2d:
+            self.train_id = None  # Will be generated later
+        else:
+            self.train_id = get_logger_experiment_id(self.fabric.loggers)
 
         self.last_loaded_train_id = None
         self.model_loaded_from_path: Path | None = None
@@ -522,7 +733,7 @@ class Trainer:
         self.visualize_valid_samples_every_n_steps = visualize_valid_samples_every_n_steps
         self.visualize_test_samples_every_n_steps = visualize_test_samples_every_n_steps
 
-        if logger_name == "wandb" and exists(watch_model):
+        if logger_name == "wandb" and exists(watch_model) and not self.use_native_deepspeed_2d:
             assert package_available(
                 "wandb"
             ), "Please install and use the `wandb` package to log model gradients/parameters."
@@ -548,11 +759,19 @@ class Trainer:
     @property
     def device(self) -> torch.device:
         """Get device."""
+        if self.use_native_deepspeed_2d:
+            # Use local rank, not global rank for device assignment
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            num_gpus_per_node = torch.cuda.device_count()
+            local_rank = local_rank % num_gpus_per_node
+            return torch.device(f"cuda:{local_rank}")
         return self.fabric.device
 
     @property
     def is_main(self) -> bool:
         """Check if main rank."""
+        if self.use_native_deepspeed_2d:
+            return dist.get_rank() == 0
         return self.fabric.global_rank == 0
 
     def generate_train_id(self):
@@ -618,7 +837,11 @@ class Trainer:
         )
 
         self.print(f"Saving checkpoint to {str(path)}")
-        self.fabric.save(path, package)
+        if self.use_native_deepspeed_2d:
+            # Use DeepSpeed's native checkpointing
+            self.model_engine.save_checkpoint(str(path.parent), tag=path.stem)
+        else:
+            self.fabric.save(path, package)
 
         self.wait()
 
@@ -726,7 +949,13 @@ class Trainer:
         )
 
         self.print(f"Loading checkpoint from {path}")
-        self.fabric.load(path, package, strict=strict)
+        if self.use_native_deepspeed_2d:
+            # Use DeepSpeed's native checkpoint loading
+            _, _ = self.model_engine.load_checkpoint(str(path.parent), tag=path.stem)
+            # Load additional package data manually for 2D mode
+            # TODO: Implement proper package loading for 2D mode
+        else:
+            self.fabric.load(path, package, strict=strict)
 
         # load EMA model weights
 
@@ -770,23 +999,41 @@ class Trainer:
 
     def wait(self):
         """Wait for all ranks to sync."""
-        self.fabric.barrier()
+        if self.use_native_deepspeed_2d:
+            dist.barrier()
+        else:
+            self.fabric.barrier()
 
     def print(self, *args, **kwargs):
         """Print to stdout."""
-        self.fabric.print(*args, **kwargs)
+        if self.use_native_deepspeed_2d:
+            if dist.get_rank() == 0:
+                print(*args, **kwargs)
+        else:
+            self.fabric.print(*args, **kwargs)
 
     def log(self, name: str, value: Any):
         """Log dictionary."""
-        self.fabric.log(name, value, step=self.steps)
+        if self.use_native_deepspeed_2d:
+            # Simple logging for 2D mode (could be enhanced)
+            if dist.get_rank() == 0:
+                print(f"LOG {name}: {value}")
+        else:
+            self.fabric.log(name, value, step=self.steps)
 
     def log_dict(self, **log_data):
         """Log dictionary."""
-        self.fabric.log_dict(log_data, step=self.steps)
+        if self.use_native_deepspeed_2d:
+            # Simple logging for 2D mode (could be enhanced)
+            if dist.get_rank() == 0:
+                for k, v in log_data.items():
+                    print(f"LOG {k}: {v}")
+        else:
+            self.fabric.log_dict(log_data, step=self.steps)
 
     def batch_size(self) -> int:
-        """Number of samples between optimizer steps per data-parallel rank."""
-        batch_size = self.global_batch_size // (self.devices * self.num_nodes)
+        """Number of samples load to each GPU (between optimizer steps per data-parallel rank)."""
+        batch_size = self.global_batch_size // self.data_parallel_size
         assert batch_size > 0, "Effective batch size must be greater than 0."
         return batch_size
 
@@ -1030,7 +1277,7 @@ class Trainer:
         lossSoFar = [] 
 
         while self.steps < self.num_train_steps:
-            if self.steps == 121: # CAP: only train for 121 steps
+            if self.steps == 121: ## Stop at step 121
                 break 
             self.model.train()
 
@@ -1047,30 +1294,46 @@ class Trainer:
             # track time 
             if prevTime is not None:
                 diff = time.time() - prevTime
-                print(f"Time taken for training step {self.steps}: {diff}")
+                self.print(f"Time taken for training step {self.steps}: {diff}")
                 timeSoFar.append(diff)
-                print(f"Time over the steps: {timeSoFar}")
-                print(f"Loss over the steps: {lossSoFar}")
-                print("Memory usage: " + SynchronizedWallClockTimer.memory_usage())
+                self.print(f"Time over the steps: {timeSoFar}")
+                self.print(f"Loss over the steps: {lossSoFar}")
+                self.print("Memory usage: " + SynchronizedWallClockTimer.memory_usage())
             prevTime = time.time()
 
             train_batch = next(dl)
+            
+            # Move batch to device for distributed training
+            if self.use_native_deepspeed_2d or self.using_deepspeed_strategy:
+                # For DeepSpeed, need to explicitly move data to GPU
+                train_batch = train_batch.to(self.device)
+
             input = train_batch.dict()
-            print("\n Sequence length: ", input["is_molecule_types"].shape[1])
-           
+            
+            # Get filepath info (it's a list since batch can contain multiple files)
+            filepaths = input.get("filepath", ["Unknown"])
+            filepath_str = filepaths[0] if filepaths and filepaths[0] is not None else "Unknown"
+            
+            print(f"\nRank {dist.get_rank()} | Filepath: {filepath_str} | Sequence length: {input['is_molecule_types'].shape[1]} | MSA length: {input["msa"].shape[1]}")
+
             # maybe profile
 
             if self.profile:
                 self.profiler.step()
-
                 if self.steps >= 1 + 1 + 3:
                     break
 
             # forward pass
 
-            with self.fabric.no_backward_sync(
-                self.model, enabled=is_accumulating and not self.using_deepspeed_strategy
-            ):
+            # Handle gradient synchronization
+            sync_context = (
+                nullcontext() if self.use_native_deepspeed_2d 
+                else self.fabric.no_backward_sync(
+                    self.model, enabled=is_accumulating and not self.using_deepspeed_strategy
+                )
+            )
+            
+            with sync_context:
                 loss_breakdown = None
 
                 try:
@@ -1078,7 +1341,7 @@ class Trainer:
                         self.print(f"Step {self.steps}, Accum {grad_accum_iter} | Forward pass...")
 
                     loss, loss_breakdown = timeout(
-                        dec_timeout=FORWARD_MAX_SECONDS_PER_INPUT,
+                        dec_timeout=FORWARD_MAX_SECONDS_PER_INPUT if self.steps > 0 else 12000, # first step can be slow
                         use_signals=True,
                         timeout_exception=BaseException,
                     )(self.model.__call__)(
@@ -1089,6 +1352,24 @@ class Trainer:
                         # verbose=verbose == "extra",
                     )
 
+                    print(f"Rank {dist.get_rank()} | Memory after forward pass: {SynchronizedWallClockTimer.memory_usage()}")
+
+                    # Pre-backward high memory guard: abort this step when cached memory exceeds 70% of HBM
+                    current_device = (
+                        self.device.index
+                        if isinstance(self.device, torch.device)
+                        else torch.cuda.current_device()
+                    )
+                    total_hbm_bytes = torch.cuda.get_device_properties(current_device).total_memory
+                    threshold_bytes = int(0.7 * total_hbm_bytes)
+                    # memory_cached(), not memory_allocated(), since fairer for pytorch allocator
+                    cached_bytes = torch.cuda.memory_reserved(current_device)
+
+                    if cached_bytes >= threshold_bytes:
+                        raise RuntimeError(
+                            f"PreBackwardHighMemory guard: cached={cached_bytes} bytes >= 70% HBM ({threshold_bytes} bytes)"
+                        )
+
                 except BaseException as e:
                     self.print(
                         f"Step {self.steps}, Accum {grad_accum_iter} | Skipping training batch due to forward base exception: {e}, {traceback.format_exc()}"
@@ -1098,6 +1379,10 @@ class Trainer:
                     if "out of memory" in str(e):
                         self.print(
                             f"Step {self.steps}, Accum {grad_accum_iter} | Failing on training batch forward due to GPU being out of memory."
+                        )
+                    if "PreBackwardHighMemory" in str(e):
+                        self.print(
+                            f"Step {self.steps}, Accum {grad_accum_iter} | PreBackwardHighMemory guard triggered; skipping this step."
                         )
 
                 except Exception as e:
@@ -1110,11 +1395,28 @@ class Trainer:
                         self.print(
                             f"Step {self.steps}, Accum {grad_accum_iter} | Failing on training batch forward due to GPU being out of memory."
                         )
+                    if "PreBackwardHighMemory" in str(e):
+                        self.print(
+                            f"Step {self.steps}, Accum {grad_accum_iter} | PreBackwardHighMemory guard triggered; skipping this step."
+                        )
 
                 # skip step if any device fails its forward pass (e.g., by running out of memory)
-
                 self.wait()
-                losses = self.fabric.all_gather(loss)
+                
+                # print loss for each GPU
+                print(f"\nRank {dist.get_rank()} | Loss: {loss.item():.3f}")
+
+                # Gather losses just to check loss is not nan/inf           
+                if self.use_native_deepspeed_2d:
+                    parallel_info = get_parallel_info()
+                    if parallel_info["ddp_size"] > 1:
+                        gathered_losses = [torch.zeros_like(loss) for _ in range(parallel_info["ddp_size"])]
+                        dist.all_gather(gathered_losses, loss, group=parallel_info["current_ddp_process_group"]) # only gather within the same DP group because loss of SP group is the same 
+                        losses = torch.stack(gathered_losses)
+                    else:
+                        losses = loss
+                else:
+                    losses = self.fabric.all_gather(loss)
 
                 if torch.isnan(losses).any() or torch.isinf(losses).any():
                     self.print(
@@ -1135,8 +1437,11 @@ class Trainer:
                     grad_accum_iter = 0
                     is_accumulating = grad_accum_iter < self.grad_accum_every
 
+                    # Do not track timing for this skipped step
+                    prevTime = None
+
                     self.wait()
-                    continue
+                    continue # If nan loss, since all processes have allgathered, they will all "continue" and get the next batch here
 
                 # backward pass
 
@@ -1145,15 +1450,21 @@ class Trainer:
                         self.print(
                             f"Step {self.steps}, Accum {grad_accum_iter} | Backward pass..."
                         )
-                    # NOTE: DeepSpeed handles gradient accumulation internally
-                    self.fabric.backward(
-                        loss / (1.0 if self.using_deepspeed_strategy else self.grad_accum_every)
-                    )
+                    if self.use_native_deepspeed_2d:
+                        # Native DeepSpeed 2D handles gradient accumulation internally
+                        self.model_engine.backward(loss)
+                    else:
+                        self.fabric.backward(
+                            loss / (1.0 if self.using_deepspeed_strategy else self.grad_accum_every)
+                        )
                 except Exception as e:
                     self.print(
                         f"Step {self.steps}, Accum {grad_accum_iter} | Failing on training batch backward due to exception: {e}, {traceback.format_exc()}"
                     )
-                    raise e
+                    raise e ## raise error to terminate the entire process (we don't want this, we just want to skip any OOM process)
+                    ## the OOM gpu will terminate but since it's in the backward pass -- other ranks just keep waiting for grad synch from this OOM rank and thus silently failed
+
+                print(f"Rank {dist.get_rank()} | Memory after backward pass: {SynchronizedWallClockTimer.memory_usage()}")
 
             # proceed only after accumulating all gradients
 
@@ -1173,7 +1484,7 @@ class Trainer:
 
                 # gradient clipping
 
-                if self.clip_grad_norm > 0 and not self.using_deepspeed_strategy:
+                if self.clip_grad_norm > 0 and not self.using_deepspeed_strategy and not self.use_native_deepspeed_2d: # NOTE: DeepSpeed handles gradient clipping internally
                     if verbose == "extra":
                         self.print(
                             f"Step {self.steps} | Clipping gradients to a maximum norm of {self.clip_grad_norm}..."
@@ -1187,7 +1498,11 @@ class Trainer:
                 if verbose == "extra":
                     self.print(f"Step {self.steps} | Optimization...")
 
-                self.model_optimizer.step()
+                if self.use_native_deepspeed_2d:
+                    # DeepSpeed handles optimizer step
+                    self.model_engine.step()
+                else:
+                    self.model_optimizer.step()
 
                 # update exponential moving average
 
@@ -1204,7 +1519,7 @@ class Trainer:
 
                 # zero gradients
 
-                if not isinstance(self.fabric.strategy, DeepSpeedStrategy):
+                if self.fabric and (not isinstance(self.fabric.strategy, DeepSpeedStrategy)) and (not self.use_native_deepspeed_2d):
                     # NOTE: DeepSpeed handles gradient zeroing internally
 
                     if verbose == "extra":
@@ -1217,7 +1532,12 @@ class Trainer:
                 if verbose == "extra":
                     self.print(f"Step {self.steps} | Scheduler update...")
 
-                self.scheduler.step()
+                if self.use_native_deepspeed_2d:
+                    # DeepSpeed automatically manages scheduler step when lr_scheduler is passed to initialize()
+                    # Do NOT call scheduler.step() manually - DeepSpeed handles it internally
+                    pass
+                else:
+                    self.scheduler.step()
 
                 # increment steps
 
@@ -1318,6 +1638,10 @@ class Trainer:
                         eval_model.eval()
 
                         for valid_batch_idx, valid_batch in enumerate(self.valid_dataloader):
+                            # Move batch to device for distributed training
+                            if self.use_native_deepspeed_2d or self.using_deepspeed_strategy:
+                                valid_batch = valid_batch.to(self.device)
+                                
                             if (
                                 exists(self.num_valid_steps)
                                 and valid_batch_idx >= self.num_valid_steps
@@ -1585,6 +1909,10 @@ class Trainer:
                 eval_model.eval()
 
                 for test_batch_idx, test_batch in enumerate(self.test_dataloader):
+                    # Move batch to device for distributed training
+                    if self.use_native_deepspeed_2d or self.using_deepspeed_strategy:
+                        test_batch = test_batch.to(self.device)
+                        
                     if exists(self.num_test_steps) and test_batch_idx >= self.num_test_steps:
                         self.print(
                             f"Step {self.steps} |"
@@ -1787,9 +2115,9 @@ class Trainer:
             assert trace_files, "No trace files found."
 
             profile_art.add_file(trace_files[0], "trace.pt.trace.json")
-            self.fabric.logger.experiment.log_artifact(profile_art)
+            if not self.use_native_deepspeed_2d:
+                self.fabric.logger.experiment.log_artifact(profile_art)
 
             self.print("Profiler artifacts logged.")
 
         print("Training complete.")
-

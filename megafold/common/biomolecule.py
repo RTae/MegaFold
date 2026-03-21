@@ -52,7 +52,7 @@ MMCIF_PREFIXES_TO_DROP_POST_PARSING = [
     "_struct_asym.",
     "_struct_conn.",
 ]
-MMCIF_PREFIXES_TO_DROP_POST_OMNIFOLD = MMCIF_PREFIXES_TO_DROP_POST_PARSING + [
+MMCIF_PREFIXES_TO_DROP_POST_MEGAFOLD = MMCIF_PREFIXES_TO_DROP_POST_PARSING + [
     "_audit_author.",
     "_citation.",
     "_citation_author.",
@@ -1612,7 +1612,7 @@ def to_mmcif(
 
     init_metadata_dict = (
         remove_metadata_fields_by_prefixes(
-            orig_mmcif_metadata, MMCIF_PREFIXES_TO_DROP_POST_OMNIFOLD
+            orig_mmcif_metadata, MMCIF_PREFIXES_TO_DROP_POST_MEGAFOLD
         )
         if insert_megafold_mmcif_metadata
         else remove_metadata_fields_by_prefixes(
@@ -2149,7 +2149,7 @@ def to_inference_mmcif(
 
     init_metadata_dict = (
         remove_metadata_fields_by_prefixes(
-            orig_mmcif_metadata, MMCIF_PREFIXES_TO_DROP_POST_OMNIFOLD
+            orig_mmcif_metadata, MMCIF_PREFIXES_TO_DROP_POST_MEGAFOLD
         )
         if insert_megafold_mmcif_metadata
         else remove_metadata_fields_by_prefixes(

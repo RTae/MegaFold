@@ -103,6 +103,10 @@ from megafold.utils.model_utils import (
     to_pairwise_mask,
 )
 from megafold.utils.utils import default, exists, first, maybe_cache, not_exists
+
+# Check for distributed training to avoid cache race conditions
+import torch.distributed as dist
+
 from scripts.cluster_pdb_train_mmcifs import (
     NUCLEIC_LETTERS_3TO1_EXTENDED,
     PROTEIN_LETTERS_3TO1_EXTENDED,
@@ -498,6 +502,25 @@ class BatchedAtomInput:
         """Return the dataclass as a dictionary with all enclosed tensors residing in CPU
         memory."""
         return {k: (v.cpu() if torch.is_tensor(v) else v) for (k, v) in asdict(self).items()}
+
+    def to(self, device):
+        """Move all tensor fields to the specified device."""
+        def move_to_device(obj):
+            if torch.is_tensor(obj):
+                return obj.to(device)
+            elif isinstance(obj, list):
+                return [move_to_device(item) for item in obj]
+            elif isinstance(obj, dict):
+                return {k: move_to_device(v) for k, v in obj.items()}
+            else:
+                return obj
+        
+        # Create new instance with moved tensors
+        new_data = {}
+        for field_name, field_value in asdict(self).items():
+            new_data[field_name] = move_to_device(field_value)
+        
+        return BatchedAtomInput(**new_data)
 
     def model_forward_dict(self):
         """Return the dataclass as a dictionary without certain model fields."""
@@ -4541,8 +4564,9 @@ def pdb_input_to_molecule_input(
     else:
         print("building input_features from scratch")
         input_features = build_pdb_input_features(i, biomol=biomol, verbose=verbose)
-
-        if exists(input_cache_path) and os.access(i.input_cache_dir, os.W_OK):
+        is_distributed = dist.is_available() and dist.is_initialized()
+        should_write_cache = not is_distributed
+        if exists(input_cache_path) and os.access(i.input_cache_dir, os.W_OK) and should_write_cache:
             os.makedirs(os.path.dirname(input_cache_path), exist_ok=True)
             with gzip.GzipFile(input_cache_path, "w") as f:
                 np.save(f, input_features)
@@ -4671,7 +4695,6 @@ def pdb_input_to_molecule_input(
         with gzip.GzipFile(msa_cache_path, "r") as f:
             msa_features = np.load(f, allow_pickle=True).item()
             print("taking msas from cache")
-            #print(msa_features)
     else:
         print("building msas from scratch")
         # build required biomolecule features for MSA construction
@@ -4719,11 +4742,11 @@ def pdb_input_to_molecule_input(
                 distillation_pdb_ids=i.distillation_pdb_ids,
                 verbose=verbose in ("standard", "extra"),
             )
-
-        if exists(msa_cache_path) and os.access(i.msa_cache_dir, os.W_OK):
+        is_distributed = dist.is_available() and dist.is_initialized()
+        should_write_cache = not is_distributed
+        if exists(msa_cache_path) and os.access(i.msa_cache_dir, os.W_OK) and should_write_cache:
             os.makedirs(os.path.dirname(msa_cache_path), exist_ok=True)
             with gzip.GzipFile(msa_cache_path, "w") as f:
-                #print("Saving to cache msa_features")
                 np.save(f, msa_features)
 
         if i.cache_msa_only:
@@ -5688,7 +5711,6 @@ class PDBDataset(Dataset):
                 }
 
             cache_input_only = pdb_input_kwargs.get("cache_input_only", False)
-            #print("cache_input_only", cache_input_only)
             if cache_input_only:
                 # filter to only files for which input features have not already been cached
                 self.files = {
@@ -5706,7 +5728,7 @@ class PDBDataset(Dataset):
             assert len(self) > 0 or (
                 cache_msa_only or cache_input_only
             ), f"No valid mmCIFs / PDBs found at {str(folder)} after initial filtering."
-        
+
         if exists(filter_out_pdb_ids):
             if exists(self.sampler) and exists(mmcif_metadata_filepath):
                 assert not any(

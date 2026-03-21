@@ -1,28 +1,21 @@
-# MegaFold: System-Level Optimizations for Accelerating Protein Structure Prediction Models
+# MegaFold: Efficient Training of Next-Generation 3D Attention Protein Models on Cross-Platform GPUs
 
-[![](https://img.shields.io/badge/Paper-PDF-blue)](https://arxiv.org/abs/2506.20686)
-[![](https://img.shields.io/badge/project-page-purple)](https://supercomputing-system-ai-lab.github.io/projects/megafold/)
-![](https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green)
-![](https://img.shields.io/badge/AMD-support-red?style=flat&logo=amd&logoColor=black&labelColor=white)
+## News
 
+- [03/2026] Officially accepted to ISC High Performance 2026! 
+- [06/2025] Code is released.
 
-## News 
-
-- [06/2025] MegaFold code is released. 
-
-
-## About 
+## About
 
 [MegaFold](https://arxiv.org/abs/2506.20686) is a cross-platform system to accelerate protein structure prediction models (e.g., AlphaFold3, AlphaFold2).
 
 Why MegaFold? 
 
 - **Cross-platform support**: Supports execution on heterogeneous devices, including NVIDIA GPUs and AMD GPUs, through optimized Triton-based kernels.
-- **Ease of use**: Delivers huge performance gains with few lines of code change
+- **Sequence length extension**: Enables training on 3.36x longer sequence lengths
 - **Speed improvement**: Accelerates per-iteration training time by up to 1.73x
 - **Memory reduction**: Reduces peak memory during training by up to 1.23x
-- **Sequence length extension**: Enables training on 1.35x longer sequence lengths
-
+- **Ease of use**: Delivers huge performance gains with few lines of code change
 
 ## Usage
 
@@ -43,6 +36,7 @@ pip install -r requirements.txt
 ```
 
 ---
+
 ### Prepare experiment dataset
 
 First, download a sample dataset from the Protein Data Bank (PDB). 
@@ -101,20 +95,29 @@ rm input_cache
 ```
 
 ---
+
 ### Run code
 
-``` 
-python3 train.py --config configs/megafold_interactive.yaml --trainer_name initial_training
+```
+# Run MegaFold 1x1 (DPxSP) config on single-GPU
+deepspeed --num_gpus=1 train.py --config configs/megafold_1x1.yaml --trainer_name initial_training
+
+# Run MegaFold 1x2 (DPxSP) config on 2 GPUs
+deepspeed --num_gpus=2 train.py --config configs/megafold_1x2.yaml --trainer_name initial_training
 ```
 
-Script to submit batch jobs is available in `scripts`. For example, you want to launch a job with `nodes=1` and `gpus=2`: 
+Script to submit batch jobs is available in `scripts`.
 
 ```
-sbatch --nodes=1 --ntasks-per-node=2 --gpus=2 scripts/megafold.sh
-```
+# Launch MegaFold 1x1 (DPxSP) training run on single-GPU
+sbatch scripts/megafold_1x1.sh
 
+# Launch MegaFold 1x2 (DPxSP) training run on 2 GPUs
+sbatch scripts/megafold_1x2.sh
+```
 
 ---
+
 ### (optional) Full dataset & cache:
 
 If you are interested in running large-scale AlphaFold3 training, the full dataset and its cache are provided below:  
@@ -131,21 +134,13 @@ tar -xzf omniflow_caches.tar.gz && rm omniflow_caches.tar.gz
 tar -xzf omniflow_data.tar.gz && rm omniflow_data.tar.gz
 ```
 
-
 ---
 
 The following section gives detailed instructions on enabling each of our optimizations.
 
+### Optimization 1. EvoFlash-3D: Cross-Platform Implementation of Memory-Efficient 3D Attention.
 
-### Optimization 1: Data-loading
-The file `megafold/inputs.py` includes the data pipeline and implementation details for the ahead-of-time cache-based data loading optimizations. 
-
-You can find details on [deterministic input features cache](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/inputs.py#L4536-L4553) and on [MSA features cache](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/inputs.py#L4670-L4732).
-
----
-### Optimization 2: FusedEvoAttention
-The folder `megafold/model/FusedEvoAttention` includes source code of FusedEvoAttention kernel. 
-
+The folder `megafold/model/FusedEvoAttention` includes source code of EvoFlash-3D kernel. 
 
 #### Step 1: Import
 
@@ -155,7 +150,7 @@ from megafold.model.FusedEvoAttention.evoattention import TritonEvoformer
 
 #### Step 2: In-code usage
 
-`FusedEvoAttention` supports 4 main types of EvoAttention in AlphaFold models, shown in the below examples. For accuracy, you need to adjust your inputs to their suggested shapes before passing in. Acronyms: `N_seq` is the MSA depth; `N_res` is the input sequence length. 
+EvoFlash-3D supports 4 main types of EvoAttention in AlphaFold models, shown in the below examples. For accuracy, you need to adjust your inputs to their suggested shapes before passing in. Acronyms: `N_seq` is the MSA depth; `N_res` is the input sequence length. 
 
 **a. Single Attention with Pair Bias**
 
@@ -192,34 +187,45 @@ out = TritonEvoformer(Q, K, V, mask, pair_bias)
 out = TritonEvoformer(Q, K, V, mask)
 ```
 
-
 #### Step 3: Autotuning for optimal performance
 
 To achieve peak performance, the kernel's configuration (block sizes, num warps, etc.) should be tuned to your specific hardware and input shapes.
 
-1. Import `TritonEvoformer` from `megafold.model.FusedEvoAttention.unfused_evoattention` (starts with untuned kernels)
+1. Import `TritonEvoformer` from `megafold.model.FusedEvoAttention.untuned_evoattention` (starts with untuned kernels)
 2. Use it in your model's training or inference script.
-3. Run your script with autotuning enabled: 
+3. Run your script with autotuning enabled:
 
 ```
 TRITON_PRINT_AUTOTUNING=1 python your_script.py
 ```
 
-4. With autotuning enabled, Triton will explore multiple kernel configurations. Then, it will print the best configuration for your input.
-5. Let the script run for several training iterations. Take note of the most frequently selected configuration—it is likely the best one for your target hardware and input shapes (sequence length).
-6. Manually write in the best configurations for each JIT kernels and comment out the `@triton.autotune` decorator of each jit kernels. An example of an autotuned kernel for NVIDIA H200 and sequence length 384 is provided in `megafold.model.FusedEvoAttention.evoattention`.
-7. Use the modified kernel in your real workloads for best performance.
-
+1. With autotuning enabled, Triton will explore multiple kernel configurations. Then, it will print the best configuration for your input.
+2. Let the script run for several training iterations. Take note of the most frequently selected configuration—it is likely the best one for your target hardware and input shapes (sequence length).
+3. Manually write in the best configurations for each JIT kernels and comment out the `@triton.autotune` decorator of each jit kernels. An example of an autotuned kernel for NVIDIA H200 and sequence length 384 is provided in `megafold/model/FusedEvoAttention/evoattention.py`.
+4. Use the modified kernel in your real workloads for best performance.
 
 ---
-### Optimization 3: FusedLayernormLinear
-The folder `megafold/model/FusedLayernormLinear` includes source code of fused layernorm-linear kernel. 
 
+### Optimization 2. EvoSP-3D: Communication-Efficient Sharding For 2D Pairwise Representations.
+
+EvoSP-3D is a parallelism strategy tailored to 2D pairwise representations, targeting 3 modules: MSAModule, PairformerStack, DiffusionModule. It leverages communication helper functions (e.g., scatter, gather, all_to_all) from `megafold/distributed`. 
+
+You can find implementation details on [parallel MSAModule](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/model/megafold.py#L1211-L1254), [parallel PairformerStack](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/model/megafold.py#L1482-L1503), and [parallel DiffusionModule](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/model/megafold.py#L3121-L3173)
+
+---
+
+### Optimization 3. EvoFusion: Fused Operator Stack.
+
+EvoFusion consists of `FusedLayernormLinear` and `FusedTransition` kernels.
+
+The folder `megafold/model/FusedLayernormLinear` includes source code of `FusedLayernormLinear` kernel. 
+The folder `megafold/model/FusedTransition` includes source code of `FusedTransition` kernel.
 
 #### Step 1: Import
 
 ```
 from megafold.model.FusedLayernormLinear.fused_layernorm_linear import LayernormLinear
+from megafold.model.FusedTransition.fused_transition import FusedTransition
 ```
 
 #### Step 2: In-code usage
@@ -239,20 +245,6 @@ FusedLayernormLinear fuses sequential `LayerNorm` and `Linear` layers. You can r
 
 - **NOTE**: `LayernormLinear` relies on tuned configurations (block sizes, num warps, etc.), which we provide for AF3 inputs to the kernel in `helper.py`. If you intend to apply the kernel to other input shapes, you can perform the Autotuning step (similar to `FusedEvoAttention`'s Step 3) with `untuned_fused_layernorm_linear.py`
 
-
----
-### Optimization 4: FusedTransition
-The folder `megafold/model/FusedTransition` includes source code of FusedTransition kernel.
-
-
-#### Step 1: Import
-
-```
-from megafold.model.FusedTransition.fused_transition import FusedTransition
-```
-
-#### Step 2: In-code usage
-
 `FusedTransition` fuses the AF3's Transition layer (original implementation in `benchmarks/transition_speed.py`). You can replace the original Transition with `FusedTransition`.
 
 ```diff
@@ -261,10 +253,17 @@ from megafold.model.FusedTransition.fused_transition import FusedTransition
 + transition = FusedTransition(dim=dim, expansion_factor=expansion_factor)
 ```
 
-- **NOTE**: `FusedTransition` relies on FusedLayernormLinear for its expanding projections. Make sure you read FusedLayernormLinear's usage guide above. 
+- **NOTE**: `FusedTransition` relies on FusedLayernormLinear for its expanding projections. Make sure you read FusedLayernormLinear's usage guide above.
 
+---
 
-## Citation 
+### Optimization 4. EvoPipe: Determinism-Aware Host-Device Pipeline.
+
+The file `megafold/inputs.py` includes the optimized data pipeline and implementation details for the ahead-of-time cache-based data loading optimizations.
+
+You can find details on [deterministic input features cache](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/inputs.py#L4555-L4575) and on [MSA features cache](https://github.com/Supercomputing-System-AI-Lab/MegaFold/blob/main/megafold/inputs.py#L4688-L4753).
+
+## Citation
 
 ```
 @misc{la2025megafoldsystemleveloptimizationsaccelerating,
@@ -278,7 +277,8 @@ from megafold.model.FusedTransition.fused_transition import FusedTransition
 }
 ```
 
-
 ## Acknowledgement
+
 - [alphafold3-pytorch](https://github.com/lucidrains/alphafold3-pytorch) for the open-source code that MegaFold is built on top. 
 - [AMD](https://www.amd.com/) for the AMD platforms.
+

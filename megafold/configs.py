@@ -20,7 +20,6 @@ from megafold.inputs import (
     pdb_dataset_to_atom_inputs,
 )
 from megafold.nlm import NLMEmbedding
-import os 
 from megafold.model.megafold import MegaFold
 from megafold.plm import PLMEmbedding
 from megafold.tensor_typing import typecheck
@@ -105,7 +104,7 @@ class MegaFoldConfig(BaseModelWithExtra):
     loss_confidence_weight: int | float
     loss_distogram_weight: int | float
     loss_diffusion_weight: int | float
-    prior_type: Literal["diffusion"]
+    prior_type: Literal["diffusion", "flow_gaussian", "flow_harmonic"]
     multi_chain_permutation_alignment: bool
     atom_permutation_alignment: bool
     use_optimized_evo: Literal["deepspeed", "triton"] | None = None
@@ -208,11 +207,19 @@ class TrainerConfig(BaseModelWithExtra):
     clip_grad_norm: int | float
     accelerator: str
     strategy: str
+    data_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     strategy_stage: int
     checkpoint_prefix: str
     checkpoint_every: int
     checkpoint_folder: str
     overwrite_checkpoints: bool
+    default_optimizer_kwargs: dict = dict(
+        type="adam",
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+    use_ema: bool = True
     offload_optimizer: bool = False
     allgather_bucket_size: int = 200_000_000
     reduce_bucket_size: int = 200_000_000
@@ -263,7 +270,6 @@ class TrainerConfig(BaseModelWithExtra):
             model
         ), "Either model is available on the trainer config, or passed in when creating the instance, but not both or neither."
 
-        #print("from inside configs.py: ", len(dataset))
         # handle model
 
         if exists(self.model):
@@ -460,7 +466,8 @@ class TrainerConfig(BaseModelWithExtra):
                     **dataset_kwargs,
                     **dataset_specific_kwargs,
                 )
-                #print("from configs.py: ", dataset, folder, sampler, filter_out_pdb_ids_, sample_only_pdb_ids_)
+
+
                 if convert_pdb_to_atom:
                     dataset = pdb_dataset_to_atom_inputs(
                         dataset, return_atom_dataset=True, **pdb_to_atom_kwargs
@@ -605,6 +612,7 @@ class TrainerConfig(BaseModelWithExtra):
             )
         )
 
+        # Use the existing trainer (now supports 2D parallelism via strategy="deepspeed_2d")
         trainer = Trainer(**trainer_kwargs)
         return trainer
 
