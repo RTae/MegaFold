@@ -1,9 +1,15 @@
 # MegaFold: Efficient Training of Next-Generation 3D Attention Protein Models on Cross-Platform GPUs
 
+[![](https://img.shields.io/badge/Paper-PDF-blue)](https://arxiv.org/abs/2506.20686)
+[![](https://img.shields.io/badge/project-page-purple)](https://supercomputing-system-ai-lab.github.io/projects/megafold/)
+![](https://img.shields.io/badge/NVIDIA-support-green?style=flat&logo=nvidia&logoColor=green)
+![](https://img.shields.io/badge/AMD-support-red?style=flat&logo=amd&logoColor=black&labelColor=white)
+
+
 ## News
 
-- [03/2026] Officially accepted to ISC High Performance 2026! 
-- [06/2025] Code is released.
+- [03/2026] Officially accepted to ISC High Performance 2026 🎉🥳
+- [06/2025] Code is released 🖥️
 
 ## About
 
@@ -245,7 +251,9 @@ FusedLayernormLinear fuses sequential `LayerNorm` and `Linear` layers. You can r
 
 - **NOTE**: `LayernormLinear` relies on tuned configurations (block sizes, num warps, etc.), which we provide for AF3 inputs to the kernel in `helper.py`. If you intend to apply the kernel to other input shapes, you can perform the Autotuning step (similar to `FusedEvoAttention`'s Step 3) with `untuned_fused_layernorm_linear.py`
 
-`FusedTransition` fuses the AF3's Transition layer (original implementation in `benchmarks/transition_speed.py`). You can replace the original Transition with `FusedTransition`.
+
+
+FusedTransition fuses the AF3's Transition layer (original implementation in `benchmarks/transition_speed.py`). You can replace the original Transition with `FusedTransition`.
 
 ```diff
 # init
