@@ -18,9 +18,9 @@
 Why MegaFold? 
 
 - **Cross-platform support**: Supports execution on heterogeneous devices, including NVIDIA GPUs and AMD GPUs, through optimized Triton-based kernels.
-- **Sequence length extension**: Enables training on up to *3.36x* longer sequence lengths
-- **Speed improvement**: Accelerates per-iteration training time by up to *1.73x*
-- **Memory reduction**: Reduces peak memory during training by up to *1.23x*
+- **Sequence length extension**: Enables training on up to **3.36x** longer sequence lengths
+- **Speed improvement**: Accelerates per-iteration training time by up to **1.73x**
+- **Memory reduction**: Reduces peak memory during training by up to **1.23x**
 - **Ease of use**: Delivers huge performance gains with few lines of code change
 
 ## Usage
