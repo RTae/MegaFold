@@ -22,7 +22,7 @@ lion_pytorch==0.2.3
 loguru==0.7.3
 multimolecule==0.0.7
 numpy==2.3.0
-packaging==25.0
+packaging>=20.0,<25.0
 pdbeccdutils==0.8.5
 polars==1.30.0
 pydantic==2.11.5
