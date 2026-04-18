@@ -22,11 +22,6 @@ PYTHON_CMD="${PYTHON_CMD:-python}"
 NCU_CMD="${NCU_CMD:-ncu}"
 OUTPUT_DIR="${NCU_OUTPUT_DIR:-${SCRIPT_DIR}/ncu_reports}"
 
-METRICS="sm__throughput.avg.pct_of_peak_sustained_elapsed"
-METRICS+=",gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-METRICS+=",l1tex__throughput.avg.pct_of_peak_sustained_elapsed"
-METRICS+=",lts__throughput.avg.pct_of_peak_sustained_elapsed"
-
 ALL_IMPLS=(sdpa triton flashbias megafold fa3)
 
 usage() {
@@ -54,15 +49,24 @@ smoke_test() {
 
 run_one() {
     local name="$1"; shift
-    local out_file="${OUTPUT_DIR}/${name}"
     mkdir -p "${OUTPUT_DIR}"
 
-    echo "=== Profiling: ${name} ==="
+    # Parse --mode and --n-ctx from runner args to build a unique filename
+    local mode="bwd" ctx="384"
+    local args=("$@")
+    for ((i=0; i<${#args[@]}; i++)); do
+        case "${args[$i]}" in
+            --mode)   mode="${args[$((i+1))]}" ;;
+            --n-ctx)  ctx="${args[$((i+1))]}" ;;
+        esac
+    done
+    local out_file="${OUTPUT_DIR}/${name}_${mode}_ctx${ctx}"
+
+    echo "=== Profiling: ${name} mode=${mode} n-ctx=${ctx} ==="
     echo "  Output: ${out_file}.ncu-rep"
-    echo "  Runner args: $*"
 
     ${NCU_CMD} --profile-from-start off \
-        --metrics "${METRICS}" \
+        --set full \
         -o "${out_file}" \
         ${PYTHON_CMD} "${RUNNER_SCRIPT}" run "${name}" "$@"
 }
