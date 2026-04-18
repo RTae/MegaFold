@@ -202,7 +202,7 @@ def make_low_rank_bias_factors(n_ctx, n_heads):
 
 
 def sdpa_with_bias(q, k, v, res_mask, pair_bias):
-    """Run the torch SDPA baseline with additive bias and masking."""
+    """Torch SDPA baseline. Uses math/efficient backend (not FlashAttn) due to attn_mask."""
     softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     attn_mask = pair_bias.expand(-1, -1, q.shape[2], -1, -1)
     expanded_mask = res_mask.expand(-1, q.shape[1], -1, q.shape[3], -1)
@@ -235,6 +235,7 @@ def run_sdpa(args):
 
 
 def run_triton(args):
+    """FA1-Triton+bias kernel — LLM-style layout, not directly comparable to megafold."""
     try:
         from flash_bias.flash_attn_triton import FlashAttnFunc
         attention_triton = FlashAttnFunc.apply
@@ -253,6 +254,7 @@ def run_triton(args):
 
 
 def run_flashbias(args):
+    """FlashBias Triton kernel — LLM-style layout, not directly comparable to megafold."""
     try:
         from flash_bias.flash_bias_triton import FlashBiasFunc
         flashbias_triton = FlashBiasFunc.apply
@@ -291,6 +293,12 @@ def run_megafold(args):
 
 
 def run_fa3_no_bias(args):
+    """FlashAttention-3 without bias — compute ceiling baseline. Only valid at N_SEQ=1."""
+    if args.n_seq != 1:
+        print("Warning: fa3 flattens N_SEQ*N_CTX into one sequence. "
+              "Results are only meaningful at N_SEQ=1. Skipping.")
+        return False
+
     flash_attn_func = None
     last_exc = None
     for module_name in (
