@@ -50,6 +50,13 @@ SUMMARY_METRICS = [
     "sm__warps_active.avg.pct_of_peak_sustained_active",
     "launch__occupancy.avg.pct_of_peak_sustained_active",
     "gpu__time_duration.sum",
+    "l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum",
+    "smsp__inst_executed_op_global_red.sum",
+    "l1tex__t_sector_pipe_lsu_mem_global_op_red_hit_rate.pct",
+    "lts__t_sectors_srcunit_tex_op_red.sum",
+    "l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
+    "lts__t_sectors_srcunit_tex_op_red_lookup_miss.sum"
 ]
 
 

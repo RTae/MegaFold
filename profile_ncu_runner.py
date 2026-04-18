@@ -234,7 +234,7 @@ def run_sdpa(args):
     return True
 
 
-def run_triton(args):
+def run_fa1_bias(args):
     """FA1-Triton+bias kernel — LLM-style layout, not directly comparable to megafold."""
     try:
         from flash_bias.flash_attn_triton import FlashAttnFunc
@@ -249,7 +249,7 @@ def run_triton(args):
         args.mode,
         lambda: attention_triton(q, k, v, pair_bias, False, softmax_scale),
     )
-    _run_profile(fn, args.warmup, args.iters, "triton", args.mode)
+    _run_profile(fn, args.warmup, args.iters, "fa1_bias", args.mode)
     return True
 
 
@@ -348,12 +348,49 @@ def run_fa3_no_bias(args):
     return True
 
 
+def run_fa4_no_bias(args):
+    """FlashAttention-4 (CuTE) without bias — compute ceiling baseline. Only valid at N_SEQ=1."""
+    if args.n_seq != 1:
+        print("Warning: fa4 flattens N_SEQ*N_CTX into one sequence. "
+              "Results are only meaningful at N_SEQ=1. Skipping.")
+        return False
+
+    try:
+        from flash_attn.cute import flash_attn_func
+    except Exception as exc:
+        return _warn_unavailable("FlashAttention-4", exc)
+
+    q, k, v, _, _ = make_megafold_tensors(
+        args.n_seq,
+        args.n_ctx,
+        args.n_heads,
+        args.head_dim,
+    )
+    batch, n_seq, n_ctx, n_heads, head_dim = q.shape
+
+    def forward():
+        q_flat = q.reshape(batch, n_seq * n_ctx, n_heads, head_dim)
+        k_flat = k.reshape(batch, n_seq * n_ctx, n_heads, head_dim)
+        v_flat = v.reshape(batch, n_seq * n_ctx, n_heads, head_dim)
+        result = flash_attn_func(q_flat, k_flat, v_flat, causal=False)
+        output = result[0] if isinstance(result, tuple) else result
+        return output.reshape(batch, n_seq, n_ctx, n_heads, head_dim)
+
+    fn = _build_mode_fn(
+        args.mode,
+        forward,
+    )
+    _run_profile(fn, args.warmup, args.iters, "fa4", args.mode)
+    return True
+
+
 IMPLEMENTATIONS = {
     "sdpa": run_sdpa,
-    "triton": run_triton,
+    "fa1_bias": run_fa1_bias,
     "flashbias": run_flashbias,
     "megafold": run_megafold,
     "fa3": run_fa3_no_bias,
+    "fa4": run_fa4_no_bias,
 }
 
 
