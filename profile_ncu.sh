@@ -22,7 +22,7 @@ PYTHON_CMD="${PYTHON_CMD:-python}"
 NCU_CMD="${NCU_CMD:-ncu}"
 OUTPUT_DIR="${NCU_OUTPUT_DIR:-${SCRIPT_DIR}/ncu_reports}"
 
-ALL_IMPLS=(sdpa triton flashbias megafold fa3)
+ALL_IMPLS=(sdpa sdpa_no_bias fa1_bias flashbias megafold fa3 fa4)
 
 usage() {
     echo "Usage: $0 <impl|all|summary> [runner args...]"
@@ -97,7 +97,7 @@ case "${cmd}" in
     smoke)
         smoke_test
         ;;
-    sdpa|triton|flashbias|megafold|fa3)
+    sdpa|sdpa_no_bias|fa1_bias|flashbias|megafold|fa3|fa4)
         smoke_test
         run_one "${cmd}" "$@"
         ;;

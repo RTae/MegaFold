@@ -234,6 +234,41 @@ def run_sdpa(args):
     return True
 
 
+def run_sdpa_no_bias(args):
+    """Torch SDPA without bias — compute ceiling baseline. Only valid at N_SEQ=1."""
+    if args.n_seq != 1:
+        print("Warning: sdpa_no_bias flattens N_SEQ*N_CTX into one sequence. "
+              "Results are only meaningful at N_SEQ=1. Skipping.")
+        return False
+
+    q, k, v, _, _ = make_megafold_tensors(
+        args.n_seq,
+        args.n_ctx,
+        args.n_heads,
+        args.head_dim,
+    )
+    batch, n_seq, n_ctx, n_heads, head_dim = q.shape
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    def forward():
+        # Reshape to (B, N_HEADS, N_SEQ*N_CTX, HEAD_DIM) for SDPA
+        q_flat = q.reshape(batch, n_seq * n_ctx, n_heads, head_dim).permute(0, 2, 1, 3)
+        k_flat = k.reshape(batch, n_seq * n_ctx, n_heads, head_dim).permute(0, 2, 1, 3)
+        v_flat = v.reshape(batch, n_seq * n_ctx, n_heads, head_dim).permute(0, 2, 1, 3)
+        return F.scaled_dot_product_attention(
+            query=q_flat,
+            key=k_flat,
+            value=v_flat,
+            dropout_p=0.0,
+            scale=softmax_scale,
+            is_causal=False,
+        )
+
+    fn = _build_mode_fn(args.mode, forward)
+    _run_profile(fn, args.warmup, args.iters, "sdpa_no_bias", args.mode)
+    return True
+
+
 def run_fa1_bias(args):
     """FA1-Triton+bias kernel — LLM-style layout, not directly comparable to megafold."""
     try:
@@ -386,6 +421,7 @@ def run_fa4_no_bias(args):
 
 IMPLEMENTATIONS = {
     "sdpa": run_sdpa,
+    "sdpa_no_bias": run_sdpa_no_bias,
     "fa1_bias": run_fa1_bias,
     "flashbias": run_flashbias,
     "megafold": run_megafold,

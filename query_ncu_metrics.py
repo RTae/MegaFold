@@ -31,7 +31,7 @@ from io import StringIO
 from pathlib import Path
 
 FILENAME_RE = re.compile(
-    r"^(?P<impl>[a-z0-9]+)_(?P<mode>fwd|bwd|full)_ctx(?P<n_ctx>\d+)\.ncu-rep$"
+    r"^(?P<impl>[a-z0-9_]+?)_(?P<mode>fwd|bwd|full)_ctx(?P<n_ctx>\d+)\.ncu-rep$"
 )
 
 # Key metrics for the summary view
@@ -55,7 +55,6 @@ SUMMARY_METRICS = [
     "smsp__inst_executed_op_global_red.sum",
     "l1tex__t_sector_pipe_lsu_mem_global_op_red_hit_rate.pct",
     "lts__t_sectors_srcunit_tex_op_red.sum",
-    "l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
     "lts__t_sectors_srcunit_tex_op_red_lookup_miss.sum"
 ]
 

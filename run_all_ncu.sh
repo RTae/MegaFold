@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMPLS=(sdpa triton flashbias megafold)
+IMPLS=(sdpa sdpa_no_bias fa1_bias flashbias megafold fa3 fa4)
 MODES=(fwd bwd full)
 CTXS=(256 384 512 1024)
 
