@@ -33,7 +33,7 @@ model:
   atom_permutation_alignment: true
   use_optimized_evo: triton
   use_tempo_layernorm: false
-  stochastic_frame_average: true
+  stochastic_frame_average: false
   checkpoint_input_embedding: true
   checkpoint_trunk_pairformer: true
   checkpoint_diffusion_module: true
@@ -72,7 +72,7 @@ training:
     lr: 1e-4
     clip_grad_norm: 10.0
     accelerator: gpu
-    strategy: deepspeed_2d  ## Use "deepspeed_2d" for 2D parallelism
+    strategy: auto  ## Single-GPU runs do not need DeepSpeed 2D initialization
     data_parallel_size: 1 ##
     sequence_parallel_size: 1 ##
     strategy_stage: 0

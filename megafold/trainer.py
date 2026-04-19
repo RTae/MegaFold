@@ -85,6 +85,7 @@ from datetime import timedelta
 import deepspeed
 import random
 import numpy as np
+from loguru import logger
 
 
 def seed_everything(seed: int):
@@ -325,6 +326,19 @@ class Trainer:
         devices = parse_devices(devices)
         self.devices = devices
 
+        is_single_gpu_native_2d = (
+            strategy == "deepspeed_2d"
+            and num_nodes == 1
+            and data_parallel_size == 1
+            and sequence_parallel_size == 1
+        )
+
+        if is_single_gpu_native_2d:
+            logger.warning(
+                "Single-GPU run detected; downgrading strategy from deepspeed_2d to auto to avoid unnecessary distributed rendezvous."
+            )
+            strategy = "auto"
+
         if strategy == "ddp":
             # if necessary, address potential DDP activation checkpointing issue: https://discuss.pytorch.org/t/ddp-and-gradient-checkpointing/132244
             strategy = DDPStrategy(find_unused_parameters=False, static_graph=False)
@@ -360,6 +374,11 @@ class Trainer:
 
         self.train_log_interval = train_log_interval
 
+        # store parallelism settings for all strategies
+        self.global_batch_size = global_batch_size
+        self.data_parallel_size = data_parallel_size
+        self.sequence_parallel_size = sequence_parallel_size
+
         # initialize DS/Fabric
 
         if self.use_native_deepspeed_2d:
@@ -379,11 +398,6 @@ class Trainer:
             if not dist.is_initialized():
                 deepspeed.init_distributed(timeout=timedelta(seconds=120000))
 
-            # Store configuration for later use
-            self.global_batch_size = global_batch_size
-            self.data_parallel_size = data_parallel_size
-            self.sequence_parallel_size = sequence_parallel_size
-            
         else:
             if not_exists(fabric):
                 fabric = Fabric(
@@ -695,14 +709,18 @@ class Trainer:
 
         # setup dataloaders with Fabric (only for non-2D case)
         if not self.use_native_deepspeed_2d:
-            dataloaders = self.fabric.setup_dataloaders(*dataloaders)
-            
+            setup_result = self.fabric.setup_dataloaders(*dataloaders)
+            if len(dataloaders) == 1:
+                dataloaders = [setup_result]
+            else:
+                dataloaders = list(setup_result)
+
             # Reassign dataloaders after Fabric setup
             self.dataloader = dataloaders[0]
-            
+
             if self.needs_valid:
                 self.valid_dataloader = dataloaders[1]
-            
+
             if self.needs_test:
                 self.test_dataloader = dataloaders[-1]
 
@@ -1335,12 +1353,16 @@ class Trainer:
                 train_batch = train_batch.to(self.device)
 
             input = train_batch.dict()
-            
+
+            current_rank = (
+                dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            )
+
             # Get filepath info (it's a list since batch can contain multiple files)
             filepaths = input.get("filepath", ["Unknown"])
             filepath_str = filepaths[0] if filepaths and filepaths[0] is not None else "Unknown"
-            
-            print(f"\nRank {dist.get_rank()} | Filepath: {filepath_str} | Sequence length: {input['is_molecule_types'].shape[1]} | MSA length: {input["msa"].shape[1]}")
+
+            print(f"\nRank {current_rank} | Filepath: {filepath_str} | Sequence length: {input['is_molecule_types'].shape[1]} | MSA length: {input['msa'].shape[1]}")
 
             # maybe profile
 
@@ -1378,7 +1400,7 @@ class Trainer:
                         # verbose=verbose == "extra",
                     )
 
-                    print(f"Rank {dist.get_rank()} | Memory after forward pass: {SynchronizedWallClockTimer.memory_usage()}")
+                    print(f"Rank {current_rank} | Memory after forward pass: {SynchronizedWallClockTimer.memory_usage()}")
 
                     # Pre-backward high memory guard: abort this step when cached memory exceeds 70% of HBM
                     current_device = (
@@ -1430,7 +1452,7 @@ class Trainer:
                 self.wait()
                 
                 # print loss for each GPU
-                print(f"\nRank {dist.get_rank()} | Loss: {loss.item():.3f}")
+                print(f"\nRank {current_rank} | Loss: {loss.item():.3f}")
 
                 # Gather losses just to check loss is not nan/inf           
                 if self.use_native_deepspeed_2d:
@@ -1490,7 +1512,7 @@ class Trainer:
                     raise e ## raise error to terminate the entire process (we don't want this, we just want to skip any OOM process)
                     ## the OOM gpu will terminate but since it's in the backward pass -- other ranks just keep waiting for grad synch from this OOM rank and thus silently failed
 
-                print(f"Rank {dist.get_rank()} | Memory after backward pass: {SynchronizedWallClockTimer.memory_usage()}")
+                print(f"Rank {current_rank} | Memory after backward pass: {SynchronizedWallClockTimer.memory_usage()}")
 
             # proceed only after accumulating all gradients
 

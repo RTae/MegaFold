@@ -10019,9 +10019,10 @@ class MegaFold(Module):
             if not return_loss_breakdown:
                 return loss
 
-            return loss, loss_breakdown    
+            return loss, loss_breakdown
+
     def print(self, *args, **kwargs):
-        if dist.get_rank() == 0:
+        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             print(*args, **kwargs)
 
 

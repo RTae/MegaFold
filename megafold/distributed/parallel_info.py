@@ -37,10 +37,21 @@ _PARALLEL_INFO = None
 
 
 def get_parallel_info():
-    """Get the current parallel configuration"""
+    """Get the current parallel configuration."""
     global _PARALLEL_INFO
     if _PARALLEL_INFO is None:
-        return None
+        return {
+            'ddp_groups': [[0]],
+            'sp_groups': [[0]],
+            'current_ddp_group': [0],
+            'current_sp_group': [0],
+            'current_ddp_process_group': None,
+            'current_sp_process_group': None,
+            'ddp_rank': 0,
+            'sp_rank': 0,
+            'ddp_size': 1,
+            'sp_size': 1,
+        }
     return _PARALLEL_INFO
 
 
