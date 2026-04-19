@@ -1,0 +1,150 @@
+---
+checkpoint_folder: ./outputs/smoke-test
+checkpoint_prefix: megafold.
+training_order:
+  - initial_training
+model:
+  dim_atom_inputs: 3
+  dim_template_feats: 108
+  dim_template_model: 64
+  num_atom_embeds: 47
+  num_atompair_embeds: 11
+  atoms_per_window: 27
+  dim_atom: 128
+  dim_atompair_inputs: 5
+  dim_atompair: 16
+  dim_input_embedder_token: 384
+  dim_single: 384
+  dim_pairwise: 128
+  dim_token: 768
+  ignore_index: -1
+  num_dist_bins: 64
+  num_plddt_bins: 50
+  num_pde_bins: 64
+  num_pae_bins: 64
+  sigma_data: 16
+  loss_confidence_weight: 0.0001
+  loss_distogram_weight: 0.03
+  loss_diffusion_weight: 4.0
+  prior_type: diffusion
+  multi_chain_permutation_alignment: true
+  atom_permutation_alignment: true
+  use_optimized_evo: triton
+  use_tempo_layernorm: false
+  stochastic_frame_average: false
+  checkpoint_input_embedding: true
+  checkpoint_trunk_pairformer: true
+  checkpoint_diffusion_module: true
+  checkpoint_distogram_head: false
+  checkpoint_confidence_head: true
+  disable_distogram_casting: true
+  disable_edm_casting: true
+  disable_sampling_casting: true
+  disable_confidence_casting: true
+  disable_loss_casting: true
+  input_independent_baseline: false
+  constraints: [pocket, contact, docking]
+  pairformer_stack:
+    {
+      depth: 4,
+      pair_bias_attn_dim_head: 64,
+      pair_bias_attn_heads: 16,
+      dropout_row_prob: 0.25,
+      pairwise_block_kwargs: {},
+    }
+training:
+  initial_training:
+    num_train_steps: 3
+    num_valid_steps: 1
+    num_test_steps: null
+    global_batch_size: 1
+    devices: 1
+    num_nodes: 1
+    seed: 42
+    grad_accum_every: 1
+    clear_cuda_cache_every: 1
+    confidence_head_interval: 10
+    valid_every: 100000
+    ema_decay: 0.999
+    lr: 1e-4
+    clip_grad_norm: 10.0
+    accelerator: gpu
+    strategy: auto
+    data_parallel_size: 1
+    sequence_parallel_size: 1
+    strategy_stage: 0
+    checkpoint_prefix: ckpt.
+    checkpoint_every: 100000
+    checkpoint_folder: "."
+    overwrite_checkpoints: false
+    precision: null
+    profile: false
+    profiler_kwargs: {log_dir: "./profiled"}
+    diffusion_num_augmentations: 1
+    diffusion_add_smooth_lddt_loss: true
+    diffusion_add_bond_loss: false
+    train_structure_and_distogram: true
+    train_pae: false
+    is_fine_tuning: false
+    num_samples_per_example: 1
+    visualize_train_samples_every_n_steps: 0
+    visualize_valid_samples_every_n_steps: 0
+    visualize_test_samples_every_n_steps: 0
+    watch_model: all
+    watch_model_freq: 10
+    train_log_interval: 1
+    logger_name: csv
+    logger_kwargs:
+      out_dir: "."
+      name: auto
+      save_dir: ./logs/smoke_test
+      resume: allow
+      project: MegaFold
+      entity: bml-lab
+      group: megafold-smoke-test
+      tags: ["pdb", "megafold", "smoke_test"]
+    dataset_config:
+      dataset_type: pdb
+      train_folder: ./data/pdb_data/val_mmcifs
+      pdb_distillation: false
+      pdb_distillation_only: false
+      kwargs:
+        contiguous_weight: 0.2
+        spatial_weight: 0.4
+        spatial_interface_weight: 0.4
+        crop_size: 128
+        max_msas_per_chain: 128
+        max_num_msa_tokens: 32768
+        max_templates_per_chain: 4
+        num_templates_per_chain: 1
+        max_num_template_tokens: 512
+        max_num_atoms: 2500
+        min_length: null
+        filter_for_alphabetic_chain_orderings: true
+        max_length: 512
+        constraints: [pocket, contact, docking]
+        constraints_ratio: 0.05
+        mmcif_metadata_filepath: ./caches/pdb_data/metadata/mmcif.csv
+        pdbbind_binding_affinity_values_path: ./caches/pdb_data/metadata/binding_affinity_values.txt
+      train_kwargs:
+        sample_type: default
+        msa_cache_dir: ./caches/pdb_data/cache/msa/val_msas
+        input_cache_dir: ./caches/pdb_data/cache/input/val_inputs
+        training: true
+        inference: false
+        return_atom_inputs: true
+      valid_kwargs:
+        sample_type: default
+        msa_dir: ./data/pdb_data/data_caches/msa/val_msas
+        templates_dir: ./data/pdb_data/data_caches/template/val_templates
+        msa_cache_dir: ./caches/pdb_data/cache/msa/val_msas
+        input_cache_dir: ./caches/pdb_data/cache/input/val_inputs
+        training: false
+        inference: false
+        return_atom_inputs: true
+      dl_kwargs:
+        num_workers: 2
+        pin_memory: true
+        multiprocessing_context: spawn
+        prefetch_factor: 2
+        persistent_workers: false
