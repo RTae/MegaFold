@@ -5,3 +5,6 @@ __pycache__/
 *.a3m
 *.a2m
 *.m8
+data/pdb_data/data_caches/train_clusterings/*
+data/pdb_data/data_caches/val_clusterings/*
+data/pdb_data/data_caches/test_clusterings/*
