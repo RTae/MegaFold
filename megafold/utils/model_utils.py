@@ -60,7 +60,7 @@ IS_MOLECULE_TYPES = 5
 
 # helper functions
 
-_PAIR_BIAS_CAPTURE_STATE = {"count": 0}
+_PAIR_BIAS_CAPTURE_STATE = {"count": 0, "seen": 0}
 
 
 def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pair_bias") -> None:
@@ -70,7 +70,11 @@ def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pai
         return
 
     limit = int(os.environ.get("MEGAFOLD_PAIR_BIAS_LIMIT", "4"))
-    if _PAIR_BIAS_CAPTURE_STATE["count"] >= limit:
+    start_index = int(os.environ.get("MEGAFOLD_PAIR_BIAS_START", "0"))
+    seen_index = _PAIR_BIAS_CAPTURE_STATE["seen"]
+    _PAIR_BIAS_CAPTURE_STATE["seen"] += 1
+
+    if seen_index < start_index or _PAIR_BIAS_CAPTURE_STATE["count"] >= limit:
         return
 
     if isinstance(pair_bias, tuple):
@@ -95,6 +99,7 @@ def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pai
 
         stats = {
             "tag": tag,
+            "forward_call_index": seen_index,
             "shape": list(pair_bias.shape),
             "dtype": str(pair_bias.dtype),
             "mean": float(pair_bias.mean().item()),

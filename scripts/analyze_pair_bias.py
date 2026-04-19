@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 
-def normalize_pair_bias(tensor: torch.Tensor) -> torch.Tensor:
+def normalize_pair_bias(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
     tensor = tensor.detach().float().cpu()
 
     if tensor.ndim == 2:
@@ -19,66 +19,78 @@ def normalize_pair_bias(tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.reshape(-1, tensor.shape[-2], tensor.shape[-1])
 
     if tensor.ndim != 3:
-        raise ValueError(f"Expected a 2D/3D/4D pair-bias tensor, got shape {tuple(tensor.shape)}")
+        raise ValueError(f"Expected a 2D/3D/4D/5D pair-bias tensor, got shape {tuple(tensor.shape)}")
 
-    if tensor.shape[-1] != tensor.shape[-2]:
-        raise ValueError(
-            "Expected a square attention-bias matrix. The captured tensor looks windowed; "
-            "inspect the raw tensor directly for window-local structure."
-        )
-
-    return tensor
+    is_square = tensor.shape[-1] == tensor.shape[-2]
+    return tensor, is_square
 
 
 def summarize_pair_bias(tensor: torch.Tensor) -> dict:
-    heads = normalize_pair_bias(tensor)
-    n = heads.shape[-1]
+    heads, is_square = normalize_pair_bias(tensor)
+    q_len, k_len = heads.shape[-2], heads.shape[-1]
 
-    symmetry_abs_mean = (heads - heads.transpose(-1, -2)).abs().mean().item()
-    diag = heads.diagonal(dim1=-2, dim2=-1)
-    diag_mean = diag.mean().item()
-
-    if n > 1:
-        offdiag_mask = ~torch.eye(n, dtype=torch.bool)
-        offdiag_mean = heads[:, offdiag_mask].mean().item()
-    else:
-        offdiag_mean = 0.0
-
-    distance_profile = {}
-    for offset in range(min(n, 32)):
-        diagonals = [torch.diagonal(heads, offset=offset, dim1=-2, dim2=-1).reshape(-1)]
-        if offset > 0:
-            diagonals.append(torch.diagonal(heads, offset=-offset, dim1=-2, dim2=-1).reshape(-1))
-        merged = torch.cat(diagonals)
-        distance_profile[offset] = {
-            "mean": merged.mean().item(),
-            "std": merged.std().item(),
-        }
-
-    low_rank_energy = []
-    for head in heads[: min(4, heads.shape[0])]:
-        singular_values = torch.linalg.svdvals(head)
-        energy = (singular_values.square()).sum()
-        rank8_energy = (singular_values[: min(8, singular_values.numel())].square()).sum()
-        low_rank_energy.append((rank8_energy / energy).item() if energy > 0 else 0.0)
-
-    row_smoothness = (heads[:, 1:, :] - heads[:, :-1, :]).abs().mean().item() if n > 1 else 0.0
-    col_smoothness = (heads[:, :, 1:] - heads[:, :, :-1]).abs().mean().item() if n > 1 else 0.0
-
-    return {
+    summary = {
         "shape": list(heads.shape),
+        "is_square": is_square,
         "mean": heads.mean().item(),
         "std": heads.std().item(),
         "min": heads.min().item(),
         "max": heads.max().item(),
-        "symmetry_abs_mean": symmetry_abs_mean,
-        "diag_mean": diag_mean,
-        "offdiag_mean": offdiag_mean,
-        "row_smoothness_abs_mean": row_smoothness,
-        "col_smoothness_abs_mean": col_smoothness,
-        "rank8_energy_fraction_first_heads": low_rank_energy,
-        "distance_profile": distance_profile,
+        "row_smoothness_abs_mean": (heads[:, 1:, :] - heads[:, :-1, :]).abs().mean().item() if q_len > 1 else 0.0,
+        "col_smoothness_abs_mean": (heads[:, :, 1:] - heads[:, :, :-1]).abs().mean().item() if k_len > 1 else 0.0,
     }
+
+    if is_square:
+        n = q_len
+        symmetry_abs_mean = (heads - heads.transpose(-1, -2)).abs().mean().item()
+        diag = heads.diagonal(dim1=-2, dim2=-1)
+        diag_mean = diag.mean().item()
+
+        if n > 1:
+            offdiag_mask = ~torch.eye(n, dtype=torch.bool)
+            offdiag_mean = heads[:, offdiag_mask].mean().item()
+        else:
+            offdiag_mean = 0.0
+
+        distance_profile = {}
+        for offset in range(min(n, 32)):
+            diagonals = [torch.diagonal(heads, offset=offset, dim1=-2, dim2=-1).reshape(-1)]
+            if offset > 0:
+                diagonals.append(torch.diagonal(heads, offset=-offset, dim1=-2, dim2=-1).reshape(-1))
+            merged = torch.cat(diagonals)
+            distance_profile[offset] = {
+                "mean": merged.mean().item(),
+                "std": merged.std().item(),
+            }
+
+        low_rank_energy = []
+        for head in heads[: min(4, heads.shape[0])]:
+            singular_values = torch.linalg.svdvals(head)
+            energy = (singular_values.square()).sum()
+            rank8_energy = (singular_values[: min(8, singular_values.numel())].square()).sum()
+            low_rank_energy.append((rank8_energy / energy).item() if energy > 0 else 0.0)
+
+        summary.update(
+            {
+                "symmetry_abs_mean": symmetry_abs_mean,
+                "diag_mean": diag_mean,
+                "offdiag_mean": offdiag_mean,
+                "rank8_energy_fraction_first_heads": low_rank_energy,
+                "distance_profile": distance_profile,
+            }
+        )
+    else:
+        midpoint = k_len // 2
+        summary.update(
+            {
+                "left_half_mean": heads[..., :midpoint].mean().item() if midpoint > 0 else 0.0,
+                "right_half_mean": heads[..., midpoint:].mean().item(),
+                "edge_column_mean": torch.cat([heads[..., :1], heads[..., -1:]], dim=-1).mean().item(),
+                "center_column_mean": heads[..., max(midpoint - 1, 0) : min(midpoint + 1, k_len)].mean().item(),
+            }
+        )
+
+    return summary
 
 
 def main() -> None:
