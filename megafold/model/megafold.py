@@ -184,6 +184,7 @@ from megafold.utils.model_utils import (
     maybe,
     mean_pool_fixed_windows_with_mask,
     mean_pool_with_lens,
+    maybe_capture_pair_bias,
     pack_one,
     pad_and_window,
     pad_or_slice_to,
@@ -625,6 +626,7 @@ class AttentionPairBias(Module):
 
         # SingleAttentionPairbias (Pairformer): [b, heads, n1/2, n2]
         attn_bias = self.to_attn_bias(pairwise_repr) + attn_bias
+        maybe_capture_pair_bias(attn_bias, tag="attention_pair_bias")
 
         # Allgather attn_bias: [b, heads, n1/2, n2] -> [b, heads, n1, n2]
         if self.from_pairformer:

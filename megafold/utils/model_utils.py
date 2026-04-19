@@ -25,9 +25,12 @@
 #   }
 
 import importlib.metadata
+import json
+import os
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial, wraps
+from pathlib import Path
 
 # import einx
 import torch
@@ -56,6 +59,86 @@ ADDITIONAL_MOLECULE_FEATS = 5
 IS_MOLECULE_TYPES = 5
 
 # helper functions
+
+_PAIR_BIAS_CAPTURE_STATE = {"count": 0}
+
+
+def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pair_bias") -> None:
+    """Optionally dump a pair-bias tensor and a few structural summary stats."""
+    capture_dir = os.environ.get("MEGAFOLD_PAIR_BIAS_DIR")
+    if not capture_dir:
+        return
+
+    limit = int(os.environ.get("MEGAFOLD_PAIR_BIAS_LIMIT", "4"))
+    if _PAIR_BIAS_CAPTURE_STATE["count"] >= limit:
+        return
+
+    if isinstance(pair_bias, tuple):
+        pair_bias = pair_bias[0]
+
+    if not is_tensor(pair_bias):
+        return
+
+    with torch.no_grad():
+        pair_bias = pair_bias.detach().float().cpu()
+
+        if pair_bias.ndim >= 4:
+            pair_bias = pair_bias[:1].contiguous()
+
+        capture_idx = _PAIR_BIAS_CAPTURE_STATE["count"]
+        out_dir = Path(capture_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        tensor_path = out_dir / f"{tag}_{capture_idx:02d}.pt"
+        stats_path = out_dir / f"{tag}_{capture_idx:02d}.json"
+        torch.save(pair_bias, tensor_path)
+
+        stats = {
+            "tag": tag,
+            "shape": list(pair_bias.shape),
+            "dtype": str(pair_bias.dtype),
+            "mean": float(pair_bias.mean().item()),
+            "std": float(pair_bias.std().item()),
+            "min": float(pair_bias.min().item()),
+            "max": float(pair_bias.max().item()),
+        }
+
+        if pair_bias.shape[-1] == pair_bias.shape[-2]:
+            n = pair_bias.shape[-1]
+            flat = pair_bias.reshape(-1, n, n)
+            stats["symmetry_abs_mean"] = float(
+                (flat - flat.transpose(-1, -2)).abs().mean().item()
+            )
+
+            diag = flat.diagonal(dim1=-2, dim2=-1)
+            stats["diag_mean"] = float(diag.mean().item())
+
+            if n > 1:
+                offdiag_mask = ~torch.eye(n, dtype=torch.bool)
+                stats["offdiag_mean"] = float(flat[:, offdiag_mask].mean().item())
+            else:
+                stats["offdiag_mean"] = 0.0
+
+            max_offset = min(n, 32)
+            distance_profile = {}
+            for offset in range(max_offset):
+                diagonals = [
+                    torch.diagonal(flat, offset=offset, dim1=-2, dim2=-1).reshape(-1)
+                ]
+                if offset > 0:
+                    diagonals.append(
+                        torch.diagonal(flat, offset=-offset, dim1=-2, dim2=-1).reshape(-1)
+                    )
+                merged = torch.cat(diagonals)
+                distance_profile[str(offset)] = float(merged.mean().item())
+
+            stats["distance_profile_mean"] = distance_profile
+
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+
+        _PAIR_BIAS_CAPTURE_STATE["count"] += 1
+        logger.info(f"Saved pair-bias capture to {tensor_path}")
 
 
 @typecheck

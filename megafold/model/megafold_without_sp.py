@@ -184,6 +184,7 @@ from megafold.utils.model_utils import (
     maybe,
     mean_pool_fixed_windows_with_mask,
     mean_pool_with_lens,
+    maybe_capture_pair_bias,
     pack_one,
     pad_and_window,
     pad_or_slice_to,
@@ -613,6 +614,7 @@ class AttentionPairBias(Module):
 
         # print("pairwise_repr: (K,N)=(128, 16)", pairwise_repr.shape)
         attn_bias = self.to_attn_bias(pairwise_repr) + attn_bias
+        maybe_capture_pair_bias(attn_bias, tag="attention_pair_bias")
 
         out = self.attn(single_repr, attn_bias=attn_bias, batch_size=b, **kwargs)
         return out
