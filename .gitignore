@@ -1,2 +1,4 @@
 __pycache__/
 *.ncu-rep
+*.tar.gz
+*.cif
