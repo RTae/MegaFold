@@ -189,6 +189,7 @@ from megafold.utils.model_utils import (
     pad_or_slice_to,
     sample_harmonic_prior,
     save_args_and_kwargs,
+    safe_apply_frame_average,
     should_checkpoint,
     sum_pool_with_lens,
     symmetrize,
@@ -3107,8 +3108,8 @@ class ElucidatedAtomDiffusion(Module):
 
                 fa_atom_pos, aug_atom_pos = aug_atom_pos[:1], aug_atom_pos[1:]
 
-                fa_atom_pos = self.frame_average(
-                    fa_atom_pos.float(), frame_average_mask=atom_mask
+                fa_atom_pos = safe_apply_frame_average(
+                    self.frame_average, fa_atom_pos.float(), frame_average_mask=atom_mask
                 ).type(dtype)
 
                 fa_atom_pos = fa_atom_pos * atom_mask[..., None]
@@ -3769,8 +3770,8 @@ class ElucidatedAtomFlow(Module):
 
                 fa_atom_pos, aug_atom_pos = aug_atom_pos[:1], aug_atom_pos[1:]
 
-                fa_atom_pos = self.frame_average(
-                    fa_atom_pos.float(), frame_average_mask=atom_mask
+                fa_atom_pos = safe_apply_frame_average(
+                    self.frame_average, fa_atom_pos.float(), frame_average_mask=atom_mask
                 ).type(dtype)
 
                 fa_atom_pos = fa_atom_pos * atom_mask[..., None]

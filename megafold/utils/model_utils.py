@@ -57,6 +57,64 @@ IS_MOLECULE_TYPES = 5
 
 # helper functions
 
+
+@typecheck
+def safe_apply_frame_average(
+    frame_average_module: Module,
+    atom_pos: Tensor,
+    frame_average_mask: Tensor | None = None,
+) -> Tensor:
+    """Apply frame averaging with recovery from CUDA linalg backend failures."""
+    try:
+        return frame_average_module(atom_pos, frame_average_mask=frame_average_mask)
+    except RuntimeError as err:
+        err_msg = str(err).lower()
+        is_linalg_backend_error = any(
+            token in err_msg
+            for token in (
+                "cublas",
+                "cusolver",
+                "preferred_linalg_library",
+                "linalg.eigh",
+                "magma",
+            )
+        )
+
+        if not is_linalg_backend_error:
+            raise
+
+        preferred_linalg_library = getattr(torch.backends.cuda, "preferred_linalg_library", None)
+        if atom_pos.device.type == "cuda" and callable(preferred_linalg_library):
+            previous_backend = preferred_linalg_library()
+            try:
+                preferred_linalg_library("magma")
+                logger.warning(
+                    "Frame averaging hit a cuSOLVER error; retrying with preferred_linalg_library set to MAGMA."
+                )
+                return frame_average_module(atom_pos, frame_average_mask=frame_average_mask)
+            except Exception as magma_err:
+                logger.warning(
+                    f"preferred_linalg_library('magma') did not resolve frame averaging: {magma_err}"
+                )
+            finally:
+                preferred_linalg_library(previous_backend)
+
+        logger.warning("Frame averaging hit a CUDA linalg error; retrying on CPU for this batch.")
+        atom_pos_cpu = atom_pos.float().to("cpu")
+        mask_cpu = (
+            frame_average_mask.to("cpu") if torch.is_tensor(frame_average_mask) else frame_average_mask
+        )
+        original_device = atom_pos.device
+
+        try:
+            frame_average_module.to("cpu")
+            out = frame_average_module(atom_pos_cpu, frame_average_mask=mask_cpu)
+        finally:
+            frame_average_module.to(original_device)
+
+        return out.to(device=original_device, dtype=atom_pos.dtype)
+
+
 # default scheduler used in paper w/ warmup
 
 
@@ -870,79 +928,112 @@ def weighted_rigid_align(
     :return: The optimally aligned true coordinates.
     """
 
-    batch_size, num_points, dim = pred_coords.shape
+    def _weighted_rigid_align_impl(
+        pred_coords_: Tensor,
+        true_coords_: Tensor,
+        weights_: Tensor | None,
+        mask_: Tensor | None,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        batch_size, num_points, dim = pred_coords_.shape
 
-    if not_exists(weights):
-        # if no weights are provided, assume uniform weights
-        weights = torch.ones_like(pred_coords[..., 0])
+        if not_exists(weights_):
+            # if no weights are provided, assume uniform weights
+            weights_ = torch.ones_like(pred_coords_[..., 0])
 
-    if exists(mask):
-        # zero out all predicted and true coordinates where not an atom
-        # pred_coords = einx.where("b n, b n c, -> b n c", mask, pred_coords, 0.0)
-        # true_coords = einx.where("b n, b n c, -> b n c", mask, true_coords, 0.0)
-        # weights = einx.where("b n, b n, -> b n", mask, weights, 0.0)
-        pred_coords = pred_coords * mask[..., None]
-        true_coords = true_coords * mask[..., None]
-        weights = weights * mask
+        if exists(mask_):
+            # zero out all predicted and true coordinates where not an atom
+            pred_coords_ = pred_coords_ * mask_[..., None]
+            true_coords_ = true_coords_ * mask_[..., None]
+            weights_ = weights_ * mask_
 
-    # Take care of weights broadcasting for coordinate dimension
-    weights = rearrange(weights, "b n -> b n 1")
+        # Take care of weights broadcasting for coordinate dimension
+        weights_ = rearrange(weights_, "b n -> b n 1")
 
-    # Compute weighted centroids
-    true_centroid = (true_coords * weights).sum(dim=1, keepdim=True) / weights.sum(
-        dim=1, keepdim=True
-    )
-    pred_centroid = (pred_coords * weights).sum(dim=1, keepdim=True) / weights.sum(
-        dim=1, keepdim=True
-    )
-
-    # Center the coordinates
-    true_coords_centered = true_coords - true_centroid
-    pred_coords_centered = pred_coords - pred_centroid
-
-    if num_points < (dim + 1):
-        logger.warning(
-            "Warning: The size of one of the point clouds is <= dim+1. "
-            + "`weighted_rigid_align()` cannot return a unique rotation."
+        # Compute weighted centroids
+        true_centroid = (true_coords_ * weights_).sum(dim=1, keepdim=True) / weights_.sum(
+            dim=1, keepdim=True
+        )
+        pred_centroid = (pred_coords_ * weights_).sum(dim=1, keepdim=True) / weights_.sum(
+            dim=1, keepdim=True
         )
 
-    # Compute the weighted covariance matrix
-    cov_matrix = einsum(
-        weights * true_coords_centered, pred_coords_centered, "b n i, b n j -> b i j"
-    )
+        # Center the coordinates
+        true_coords_centered = true_coords_ - true_centroid
+        pred_coords_centered = pred_coords_ - pred_centroid
 
-    # Compute the SVD of the covariance matrix
-    U, S, V = torch.svd(cov_matrix)
-    U_T = U.transpose(-2, -1)
+        if num_points < (dim + 1):
+            logger.warning(
+                "Warning: The size of one of the point clouds is <= dim+1. "
+                + "`weighted_rigid_align()` cannot return a unique rotation."
+            )
 
-    # Catch ambiguous rotation by checking the magnitude of singular values
-    if (S.abs() <= 1e-15).any() and not (num_points < (dim + 1)):
-        logger.warning(
-            "Warning: Excessively low rank of "
-            + "cross-correlation between aligned point clouds. "
-            + "`weighted_rigid_align()` cannot return a unique rotation."
+        # Compute the weighted covariance matrix
+        cov_matrix = einsum(
+            weights_ * true_coords_centered, pred_coords_centered, "b n i, b n j -> b i j"
         )
 
-    det = torch.det(einsum(V, U_T, "b i j, b j k -> b i k"))
+        # Compute the SVD of the covariance matrix
+        U, S, V = torch.svd(cov_matrix)
+        U_T = U.transpose(-2, -1)
 
-    # Ensure proper rotation matrix with determinant 1
-    diag = torch.eye(dim, dtype=det.dtype, device=det.device)
-    diag = repeat(diag, "i j -> b i j", b=batch_size).clone()
+        # Catch ambiguous rotation by checking the magnitude of singular values
+        if (S.abs() <= 1e-15).any() and not (num_points < (dim + 1)):
+            logger.warning(
+                "Warning: Excessively low rank of "
+                + "cross-correlation between aligned point clouds. "
+                + "`weighted_rigid_align()` cannot return a unique rotation."
+            )
 
-    diag[:, -1, -1] = det
-    rot_matrix = einsum(V, diag, U_T, "b i j, b j k, b k l -> b i l")
+        det = torch.det(einsum(V, U_T, "b i j, b j k -> b i k"))
 
-    # Apply the rotation and translation
-    true_aligned_coords = (
-        einsum(rot_matrix, true_coords_centered, "b i j, b n j -> b n i") + pred_centroid
-    )
-    true_aligned_coords.detach_()
+        # Ensure proper rotation matrix with determinant 1
+        diag = torch.eye(dim, dtype=det.dtype, device=det.device)
+        diag = repeat(diag, "i j -> b i j", b=batch_size).clone()
 
-    if return_transforms:
-        translation = pred_centroid
-        return true_aligned_coords, rot_matrix, translation
+        diag[:, -1, -1] = det
+        rot_matrix = einsum(V, diag, U_T, "b i j, b j k, b k l -> b i l")
 
-    return true_aligned_coords
+        # Apply the rotation and translation
+        true_aligned_coords = (
+            einsum(rot_matrix, true_coords_centered, "b i j, b n j -> b n i") + pred_centroid
+        )
+        true_aligned_coords.detach_()
+
+        if return_transforms:
+            translation = pred_centroid
+            return true_aligned_coords, rot_matrix, translation
+
+        return true_aligned_coords
+
+    try:
+        return _weighted_rigid_align_impl(pred_coords, true_coords, weights, mask)
+    except RuntimeError as err:
+        err_msg = str(err).lower()
+        is_linalg_backend_error = any(
+            token in err_msg for token in ("cublas", "cusolver", "linalg", "svd", "magma")
+        )
+        if not is_linalg_backend_error:
+            raise
+
+        logger.warning("weighted_rigid_align hit a CUDA linalg error; retrying on CPU.")
+        weights_cpu = weights.float().to("cpu") if exists(weights) else None
+        mask_cpu = mask.to("cpu") if exists(mask) else None
+        out = _weighted_rigid_align_impl(
+            pred_coords.float().to("cpu"),
+            true_coords.float().to("cpu"),
+            weights_cpu,
+            mask_cpu,
+        )
+
+        if return_transforms:
+            aligned, rot_matrix, translation = out
+            return (
+                aligned.to(device=pred_coords.device, dtype=pred_coords.dtype),
+                rot_matrix.to(device=pred_coords.device, dtype=pred_coords.dtype),
+                translation.to(device=pred_coords.device, dtype=pred_coords.dtype),
+            )
+
+        return out.to(device=pred_coords.device, dtype=pred_coords.dtype)
 
 
 # checkpointing utils
