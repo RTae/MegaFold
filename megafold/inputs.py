@@ -29,11 +29,13 @@ from __future__ import annotations
 import copy
 import glob
 import gzip
+import importlib
 import json
 import os
 import random  # nosec
 import re
 import statistics
+import sys
 import traceback
 from collections import defaultdict
 from collections.abc import Iterable
@@ -137,6 +139,27 @@ from scripts.cluster_pdb_train_mmcifs import (
     NUCLEIC_LETTERS_3TO1_EXTENDED,
     PROTEIN_LETTERS_3TO1_EXTENDED,
 )
+
+
+def _register_legacy_pickle_module_aliases() -> None:
+    """Support loading cached pickle data created before the OmniFold->MegaFold rename."""
+    try:
+        import megafold as _megafold
+
+        sys.modules.setdefault("omnifold", _megafold)
+
+        for pkg_name in ("common", "data", "model", "utils"):
+            try:
+                sys.modules.setdefault(
+                    f"omnifold.{pkg_name}", importlib.import_module(f"megafold.{pkg_name}")
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+_register_legacy_pickle_module_aliases()
 
 # silence RDKit's warnings
 
