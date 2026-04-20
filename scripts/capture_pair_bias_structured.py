@@ -25,7 +25,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+# Ensure the repo root is on sys.path regardless of where DeepSpeed spawns the process.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from loguru import logger
@@ -61,7 +65,7 @@ def register_pair_bias_hooks(
         if to_attn_bias is None:
             continue
 
-        hook_name = f"{name}.to_attn_bias"
+        hook_name = f"{name}.to_attn_bias [{class_name}]"
 
         def make_hook(key: str):
             def _hook(_mod, _inputs, output):
