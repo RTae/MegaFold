@@ -16,4 +16,5 @@ deepspeed --master_port "$MASTER_PORT" --num_gpus=1 \
     scripts/capture_pair_bias_structured.py \
     --config "$CONFIG" \
     --trainer_name "$TRAINER_NAME" \
-    --output "$OUTPUT"
+    --output "$OUTPUT" \
+    --include_all
