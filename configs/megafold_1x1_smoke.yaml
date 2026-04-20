@@ -54,7 +54,7 @@ model:
     }
 training:
   initial_training:
-    num_train_steps: 3
+    num_train_steps: 200
     num_valid_steps: 1
     num_test_steps: null
     global_batch_size: 1
@@ -74,7 +74,7 @@ training:
     sequence_parallel_size: 1
     strategy_stage: 0
     checkpoint_prefix: ckpt.
-    checkpoint_every: 100000
+    checkpoint_every: 50
     checkpoint_folder: "."
     overwrite_checkpoints: false
     precision: null
