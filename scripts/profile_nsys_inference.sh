@@ -8,7 +8,17 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 NSYS_CMD="${NSYS_CMD:-$(command -v nsys || true)}"
-PYTHON_CMD="${PYTHON_CMD:-$(command -v python || true)}"
+PYTHON_CMD="${PYTHON_CMD:-}"
+
+if [[ -z "${PYTHON_CMD}" ]]; then
+    if [[ -x "/home/rtae/miniconda3/envs/venv/bin/python3.13" ]]; then
+        PYTHON_CMD="/home/rtae/miniconda3/envs/venv/bin/python3.13"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_CMD="python"
+    else
+        PYTHON_CMD=""
+    fi
+fi
 
 if [[ -z "${NSYS_CMD}" ]]; then
     echo "Could not find 'nsys' in PATH. Install NVIDIA Nsight Systems first." >&2
