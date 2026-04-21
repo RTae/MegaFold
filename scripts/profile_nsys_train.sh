@@ -6,6 +6,7 @@ cd "${ROOT_DIR}"
 
 NSYS_CMD="${NSYS_CMD:-nsys}"
 DEEPSPEED_CMD="${DEEPSPEED_CMD:-}"
+PYTHON_CMD="${PYTHON_CMD:-}"
 OUTPUT_DIR="${NSYS_OUTPUT_DIR:-${ROOT_DIR}/nsys_reports}"
 CONFIG="configs/megafold_1x1_smoke.yaml"
 TRAINER_NAME="initial_training"
@@ -23,6 +24,16 @@ if [[ -z "${DEEPSPEED_CMD}" ]]; then
         DEEPSPEED_CMD="/home/rtae/miniconda3/envs/venv/bin/deepspeed"
     else
         DEEPSPEED_CMD="deepspeed"
+    fi
+fi
+
+if [[ -z "${PYTHON_CMD}" ]]; then
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_CMD="python"
+    elif [[ -x "/home/rtae/miniconda3/envs/venv/bin/python3.13" ]]; then
+        PYTHON_CMD="/home/rtae/miniconda3/envs/venv/bin/python3.13"
+    else
+        PYTHON_CMD="python"
     fi
 fi
 
@@ -116,6 +127,25 @@ fi
 
 OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_NAME}"
 
+TRAIN_CMD=()
+if [[ "${NUM_GPUS}" == "1" ]]; then
+    TRAIN_CMD=(
+        "${PYTHON_CMD}" train.py
+        --config "${CONFIG}"
+        --trainer_name "${TRAINER_NAME}"
+    )
+else
+    TRAIN_CMD=(
+        "${DEEPSPEED_CMD}" --master_port "${MASTER_PORT}" --num_gpus="${NUM_GPUS}" train.py
+        --config "${CONFIG}"
+        --trainer_name "${TRAINER_NAME}"
+    )
+fi
+
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+    TRAIN_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
 echo "Tracing MegaFold training with Nsight Systems"
 echo "  Config: ${CONFIG}"
 echo "  Trainer: ${TRAINER_NAME}"
@@ -133,12 +163,12 @@ MEGAFOLD_MAX_STEPS="${EFFECTIVE_MAX_STEPS}" \
     --sample=none \
     --cpuctxsw=none \
     --wait=all \
+    --trace-fork-before-exec=true \
     --capture-range=nvtx \
     --capture-range-end=stop \
     --nvtx-capture="${CAPTURE_LABEL}" \
     --force-overwrite=true \
     -o "${OUTPUT_PATH}" \
-    "${DEEPSPEED_CMD}" --master_port "${MASTER_PORT}" --num_gpus="${NUM_GPUS}" train.py \
-    --config "${CONFIG}" \
-    --trainer_name "${TRAINER_NAME}" \
-    "${EXTRA_ARGS[@]}"
+    "${TRAIN_CMD[@]}"
+
+echo "Trace written to ${OUTPUT_PATH}.nsys-rep"
