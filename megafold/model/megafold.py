@@ -3508,39 +3508,42 @@ class ElucidatedAtomFlow(Module):
 
         all_atom_pos = [atom_pos]
 
-        for t, s in maybe_tqdm_wrapper(t_and_s, desc=tqdm_pbar_title):
-            t, s = tuple(t.unsqueeze(-1) for t in (t, s))
+        for step_idx, (t, s) in enumerate(maybe_tqdm_wrapper(t_and_s, desc=tqdm_pbar_title)):
+            with nvtx_range(f"diffusion.step_{step_idx}"):
+                t, s = tuple(t.unsqueeze(-1) for t in (t, s))
 
-            atom_pos = maybe_augment_fn(atom_pos.float()).type(dtype)
+                with nvtx_range(f"diffusion.step_{step_idx}.augment"):
+                    atom_pos = maybe_augment_fn(atom_pos.float()).type(dtype)
 
-            model_output = self.preconditioned_network_forward(
-                atom_pos,
-                t,
-                network_condition_kwargs=network_condition_kwargs,
-                use_optimized_evo=use_optimized_evo,
-            )
-
-            if umeyama_correction:
-                try:
-                    model_output = weighted_rigid_align(
-                        # NOTE: `weighted_rigid_align` returns the input-aligned model output
+                with nvtx_range(f"diffusion.step_{step_idx}.network"):
+                    model_output = self.preconditioned_network_forward(
                         atom_pos,
-                        model_output,
-                        mask=atom_mask,
+                        t,
+                        network_condition_kwargs=network_condition_kwargs,
+                        use_optimized_evo=use_optimized_evo,
                     )
-                except Exception as e:
-                    logger.warning(f"Umeyama correction failed with error {e}. Skipping...")
 
-            # interpolate with a VD-ODE solver
+                if umeyama_correction:
+                    try:
+                        with nvtx_range(f"diffusion.step_{step_idx}.umeyama"):
+                            model_output = weighted_rigid_align(
+                                # NOTE: `weighted_rigid_align` returns the input-aligned model output
+                                atom_pos,
+                                model_output,
+                                mask=atom_mask,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Umeyama correction failed with error {e}. Skipping...")
 
-            atom_pos_next = (
-                clamp_tensor(1 - ((s / t) * eta)) * model_output
-                + clamp_tensor((s / t) * eta) * atom_pos
-            )
+                with nvtx_range(f"diffusion.step_{step_idx}.update"):
+                    atom_pos_next = (
+                        clamp_tensor(1 - ((s / t) * eta)) * model_output
+                        + clamp_tensor((s / t) * eta) * atom_pos
+                    )
 
-            atom_pos = atom_pos_next
+                    atom_pos = atom_pos_next
 
-            all_atom_pos.append(atom_pos)
+                all_atom_pos.append(atom_pos)
 
         # if returning atom positions across all timesteps for visualization
         # then stack the `all_atom_pos`
@@ -8801,15 +8804,22 @@ class MegaFold(Module):
         if not isinstance(megafold_inputs, list):
             megafold_inputs = [megafold_inputs]
 
-        batched_atom_inputs = megafold_inputs_to_batched_atom_input(
-            megafold_inputs, atoms_per_window=self.w
-        )
+        with nvtx_range("inference.input.batch"):
+            batched_atom_inputs = megafold_inputs_to_batched_atom_input(
+                megafold_inputs, atoms_per_window=self.w
+            )
 
-        atom_dict = batched_atom_inputs.dict()
-        atom_dict = dict_to_device(atom_dict, device=self.device)
-        atom_dict = dict_to_float_dtype(atom_dict, dtype=dtype)
+        with nvtx_range("inference.input.atom_dict"):
+            atom_dict = batched_atom_inputs.dict()
 
-        outputs = self.forward(**atom_dict, **kwargs)
+        with nvtx_range("inference.input.to_device"):
+            atom_dict = dict_to_device(atom_dict, device=self.device)
+
+        with nvtx_range("inference.input.cast"):
+            atom_dict = dict_to_float_dtype(atom_dict, dtype=dtype)
+
+        with nvtx_range("inference.forward"):
+            outputs = self.forward(**atom_dict, **kwargs)
 
         if return_atom_dict:
             return outputs, atom_dict
@@ -8901,19 +8911,20 @@ class MegaFold(Module):
         if verbose:
             logger.info("Embedding inputs...")
 
-        (
-            single_inputs,
-            single_init,
-            pairwise_init,
-            atom_feats,
-            atompair_feats,
-        ) = self.input_embedder(
-            atom_inputs=atom_inputs,
-            atompair_inputs=atompair_inputs,
-            additional_token_feats=additional_token_feats,
-            molecule_atom_lens=molecule_atom_lens,
-            molecule_ids=molecule_ids,
-        )
+        with nvtx_range("trunk.input_embedder"):
+            (
+                single_inputs,
+                single_init,
+                pairwise_init,
+                atom_feats,
+                atompair_feats,
+            ) = self.input_embedder(
+                atom_inputs=atom_inputs,
+                atompair_inputs=atompair_inputs,
+                additional_token_feats=additional_token_feats,
+                molecule_atom_lens=molecule_atom_lens,
+                molecule_ids=molecule_ids,
+            )
 
         # handle maybe atom and atompair embeddings
 
@@ -9066,9 +9077,10 @@ class MegaFold(Module):
         if verbose:
             logger.info("Applying relative positional encoding...")
 
-        relative_position_encoding = self.relative_position_encoding(
-            additional_molecule_feats=additional_molecule_feats
-        )
+        with nvtx_range("trunk.relative_position"):
+            relative_position_encoding = self.relative_position_encoding(
+                additional_molecule_feats=additional_molecule_feats
+            )
 
         # only apply relative positional encodings to biomolecules that are chained
         # not to ligands + metal ions
@@ -9114,7 +9126,8 @@ class MegaFold(Module):
         if input_independent_baseline:
             token_bonds.fill_(False)
 
-        token_bonds_feats = self.token_bond_to_pairwise_feat(token_bonds.type(dtype))
+        with nvtx_range("trunk.token_bonds"):
+            token_bonds_feats = self.token_bond_to_pairwise_feat(token_bonds.type(dtype))
 
         pairwise_init = pairwise_init + token_bonds_feats
 
@@ -9142,6 +9155,7 @@ class MegaFold(Module):
         )
 
         for i in range(num_recycling_steps):
+            recycle_scope = f"trunk.recycle_{i}"
             # handle recycled single and pairwise if not first step
 
             recycled_single = recycled_pairwise = 0.0
@@ -9186,13 +9200,14 @@ class MegaFold(Module):
             # ensure template embedder always contributes to the loss
             self.print(f"Memory usage before templateembedder: {SynchronizedWallClockTimer.memory_usage()}")
             template_embedder_start = time.time() 
-            embedded_template = self.template_embedder(
-                templates=templates,
-                template_mask=template_mask,
-                pairwise_repr=pairwise,
-                mask=mask,
-                use_optimized_evo=use_optimized_evo,
-            )
+            with nvtx_range(f"{recycle_scope}.template"):
+                embedded_template = self.template_embedder(
+                    templates=templates,
+                    template_mask=template_mask,
+                    pairwise_repr=pairwise,
+                    mask=mask,
+                    use_optimized_evo=use_optimized_evo,
+                )
             self.templateembedder_time.append(time.time() - template_embedder_start)
             self.print(f"Time taken template embedder: {time.time() - template_embedder_start}")
             self.print(f"Memory usage after templateembedder: {SynchronizedWallClockTimer.memory_usage()}")
@@ -9218,15 +9233,16 @@ class MegaFold(Module):
 
             self.print(f"Memory usage before msamodule: {SynchronizedWallClockTimer.memory_usage()}")
             msa_module_start = time.time()
-            embedded_msa = self.msa_module(
-                msa=msa,
-                single_repr=single_inputs,
-                pairwise_repr=pairwise,
-                msa_mask=msa_mask,
-                additional_msa_feats=additional_msa_feats,
-                mask=mask,
-                use_optimized_evo=use_optimized_evo,
-            )
+            with nvtx_range(f"{recycle_scope}.msa"):
+                embedded_msa = self.msa_module(
+                    msa=msa,
+                    single_repr=single_inputs,
+                    pairwise_repr=pairwise,
+                    msa_mask=msa_mask,
+                    additional_msa_feats=additional_msa_feats,
+                    mask=mask,
+                    use_optimized_evo=use_optimized_evo,
+                )
             self.msamodule_time.append(time.time() - msa_module_start)
             self.print(f"Time taken msa module: {time.time() - msa_module_start}")
             self.print(f"Memory usage after msamodule: {SynchronizedWallClockTimer.memory_usage()}")
@@ -9240,12 +9256,13 @@ class MegaFold(Module):
 
             self.print(f"Memory usage before pairformer: {SynchronizedWallClockTimer.memory_usage()}")
             pairformer_start = time.time() 
-            single, pairwise = self.pairformer(
-                single_repr=single,
-                pairwise_repr=pairwise,
-                mask=mask,
-                use_optimized_evo=use_optimized_evo,
-            )
+            with nvtx_range(f"{recycle_scope}.pairformer"):
+                single, pairwise = self.pairformer(
+                    single_repr=single,
+                    pairwise_repr=pairwise,
+                    mask=mask,
+                    use_optimized_evo=use_optimized_evo,
+                )
             self.pairformer_time.append(time.time() - pairformer_start)
             self.print(f"Time taken pairformer: {time.time() - pairformer_start}")
             self.print(f"Memory usage after pairformer: {SynchronizedWallClockTimer.memory_usage()}")

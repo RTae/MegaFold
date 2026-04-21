@@ -2,12 +2,79 @@
 
 This repo already had Nsight Compute support. This file covers tracing the real training path through `train.py` with NVIDIA Nsight Systems.
 
+It also covers end-to-end inference tracing through `megafold/cli.py`.
+
 ## What was added
 
 - `train.py` now emits a top-level NVTX range named `train` when `MEGAFOLD_NVTX=1`.
 - `megafold/trainer.py` now emits a step-level NVTX range named `train.step_N`, plus nested ranges for dataloader, forward, backward, optimizer, EMA, zero-grad, and scheduler.
 - `megafold/model/megafold.py` and `megafold/utils/model_utils.py` now emit finer-grained NVTX ranges for trunk, diffusion, heads, and major loss terms.
 - `scripts/profile_nsys_train.sh` launches `train.py` directly for 1-GPU tracing and uses DeepSpeed only for multi-GPU tracing.
+- `scripts/profile_nsys_inference.sh` traces the inference CLI and captures end-to-end inference with NVTX ranges for input prep, trunk, diffusion steps, and output writing.
+
+## Inference tracing
+
+End-to-end inference is traced through the CLI entrypoint in `megafold/cli.py`.
+
+Important inference NVTX ranges:
+
+- `inference`: full end-to-end inference run
+- `inference.input.prepare`: sequence and constraint preprocessing plus `PDBInput` construction
+- `inference.input.batch`: atom input batching inside `forward_with_megafold_inputs`
+- `inference.input.to_device`: host-to-device transfer
+- `model.trunk`: overall trunk execution
+- `trunk.recycle_N.template`: template embedder for recycle step `N`
+- `trunk.recycle_N.msa`: MSA module for recycle step `N`
+- `trunk.recycle_N.pairformer`: Pairformer block for recycle step `N`
+- `model.sample`: overall diffusion sampling
+- `diffusion.step_N.network`: diffusion network compute for sampling step `N`
+- `diffusion.step_N.umeyama`: optional rigid-alignment correction for sampling step `N`
+- `inference.output.rank`: ranking of sampled structures
+- `inference.output.rank_N.mmcif`: mmCIF conversion for output rank `N`
+- `inference.output.rank_N.write`: final file write for output rank `N`
+
+### Recommended inference trace
+
+```bash
+scripts/profile_nsys_inference.sh -- \
+  --checkpoint outputs/your_checkpoint.pt \
+  --protein SEQUENCE_HERE \
+  --num-sample-steps 50 \
+  --num-recycling-steps 10 \
+  --num-sample-structures 1 \
+  --use-cuda true \
+  --output outputs/inference_run.cif
+```
+
+This captures the NVTX range named `inference` by default, so Python startup stays outside the report.
+
+### Inference capture examples
+
+```bash
+# End-to-end inference capture
+scripts/profile_nsys_inference.sh \
+  --output inference_e2e \
+  -- \
+  --checkpoint outputs/your_checkpoint.pt \
+  --protein SEQUENCE_HERE \
+  --num-sample-steps 50 \
+  --num-recycling-steps 10 \
+  --num-sample-structures 1 \
+  --use-cuda true \
+  --output outputs/inference_run.cif
+
+# Capture only the diffusion stage if you want a tighter report
+scripts/profile_nsys_inference.sh \
+  --output inference_diffusion_only \
+  --capture-label model.sample \
+  -- \
+  --checkpoint outputs/your_checkpoint.pt \
+  --protein SEQUENCE_HERE \
+  --num-sample-steps 50 \
+  --num-sample-structures 1 \
+  --use-cuda true \
+  --output outputs/inference_run.cif
+```
 
 ## Recommended first trace
 

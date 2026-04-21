@@ -52,7 +52,7 @@ from megafold.model.megafold import (
 )
 from megafold.tensor_typing import typecheck
 from megafold.utils.data_utils import decrement_all_by_n
-from megafold.utils.model_utils import batch_repeat_interleave, lens_to_mask, not_exists
+from megafold.utils.model_utils import batch_repeat_interleave, lens_to_mask, not_exists, nvtx_range
 from megafold.utils.utils import default, exists
 from scripts.generate_id import generate_id
 
@@ -271,159 +271,172 @@ def cli(
 
     assert output.endswith(".cif"), "Output must be a `.cif` file."
 
-    mapped_ligand = []
-    for lig in ligand:
-        if lig in CCD_COMPONENTS_SMILES:
-            lig = CCD_COMPONENTS_SMILES[lig]
-        elif lig.upper() in CCD_COMPONENTS_SMILES:
-            lig = CCD_COMPONENTS_SMILES[lig.upper()]
+    with nvtx_range("inference"):
+        with nvtx_range("inference.input.prepare"):
+            mapped_ligand = []
+            for lig in ligand:
+                if lig in CCD_COMPONENTS_SMILES:
+                    lig = CCD_COMPONENTS_SMILES[lig]
+                elif lig.upper() in CCD_COMPONENTS_SMILES:
+                    lig = CCD_COMPONENTS_SMILES[lig.upper()]
 
-        mapped_ligand.append(lig)
+                mapped_ligand.append(lig)
 
-    ligand = mapped_ligand
+            ligand = mapped_ligand
 
-    mapped_metal_ion = []
-    for met in metal_ion:
-        if met in CCD_COMPONENTS_SMILES:
-            met = CCD_COMPONENTS_SMILES[met]
-        elif met.upper() in CCD_COMPONENTS_SMILES:
-            met = CCD_COMPONENTS_SMILES[met.upper()]
+            mapped_metal_ion = []
+            for met in metal_ion:
+                if met in CCD_COMPONENTS_SMILES:
+                    met = CCD_COMPONENTS_SMILES[met]
+                elif met.upper() in CCD_COMPONENTS_SMILES:
+                    met = CCD_COMPONENTS_SMILES[met.upper()]
 
-        mapped_metal_ion.append(met)
+                mapped_metal_ion.append(met)
 
-    metal_ion = mapped_metal_ion
+            metal_ion = mapped_metal_ion
 
-    sequence_ordering = (
-        [int(idx) for idx in sequence_ordering.split("-")] if exists(sequence_ordering) else None
-    )
+            sequence_ordering = (
+                [int(idx) for idx in sequence_ordering.split("-")]
+                if exists(sequence_ordering)
+                else None
+            )
 
-    megafold_input = MegaFoldInput(
-        proteins=protein,
-        ss_rna=rna,
-        ss_dna=dna,
-        ligands=ligand,
-        metal_ions=metal_ion,
-        input_id=input_id,
-        sequence_ordering=sequence_ordering,
-    )
+            megafold_input = MegaFoldInput(
+                proteins=protein,
+                ss_rna=rna,
+                ss_dna=dna,
+                ligands=ligand,
+                metal_ions=metal_ion,
+                input_id=input_id,
+                sequence_ordering=sequence_ordering,
+            )
 
-    assert all(
-        len(c.split(":")) == 2 for c in constraints
-    ), "Constraints must be formatted as colon-separated key-value pairs - e.g., `contact:[(1,3),(2,4)]`."
-    megafold_constraints = {
-        c.split(":")[0]: decrement_all_by_n(ast.literal_eval(c.split(":")[1]), n=1)
-        for c in constraints
-    }
+            assert all(
+                len(c.split(":")) == 2 for c in constraints
+            ), "Constraints must be formatted as colon-separated key-value pairs - e.g., `contact:[(1,3),(2,4)]`."
+            megafold_constraints = {
+                c.split(":")[0]: decrement_all_by_n(ast.literal_eval(c.split(":")[1]), n=1)
+                for c in constraints
+            }
 
-    pdb_input = megafold_input_to_pdb_input(
-        megafold_input,
-        mmcif_dir=mmcif_dir,
-        msa_dir=msa_dir,
-        templates_dir=templates_dir,
-        inference=True,
-        constraints=megafold_constraints,
-        kalign_binary_path=KALIGN_BINARY_PATH,
-    )
+            pdb_input = megafold_input_to_pdb_input(
+                megafold_input,
+                mmcif_dir=mmcif_dir,
+                msa_dir=msa_dir,
+                templates_dir=templates_dir,
+                inference=True,
+                constraints=megafold_constraints,
+                kalign_binary_path=KALIGN_BINARY_PATH,
+            )
 
-    global megafold
-    if not_exists(megafold):
-        megafold = MegaFold.init_and_load(checkpoint_path, load_ema_weights=load_ema_weights)
-
-        if use_cuda and torch.cuda.is_available():
-            megafold = megafold.cuda()
-
-        megafold.eval()
-
-    with torch.no_grad():
-        (
-            sampled_atom_pos,
-            sample_logits,
-        ), sample_atom_dict = megafold.forward_with_megafold_inputs(
-            [pdb_input] * num_sample_structures,
-            dtype=INFERENCE_DTYPE,
-            return_atom_dict=True,
-            return_loss=False,
-            return_confidence_head_logits=True,
-            num_sample_steps=num_sample_steps,
-            num_recycling_steps=num_recycling_steps,
-            return_all_diffused_atom_pos=sample_trajectory,
-            use_optimized_evo=use_optimized_evo,
-        )
-
-    if sample_trajectory:
-        num_sample_structures = len(sampled_atom_pos)
-        sampled_atom_pos = sampled_atom_pos.squeeze(-3)
-        sample_logits = sample_logits.to("cpu").repeat(num_sample_structures)
-    else:
-        sampled_atom_pos, sample_logits = rank_structures(
-            sampled_atom_pos, sample_logits, sample_atom_dict, device="cpu"
-        )
-
-    os.makedirs(os.path.dirname(output), exist_ok=True)
-
-    for rank in range(num_sample_structures):
-        atom_pos = sampled_atom_pos[rank]
-        plddt = ComputeConfidenceScore.compute_plddt(sample_logits.plddt[rank : rank + 1]).squeeze(
-            0
-        )
-
-        biomol = copy.deepcopy(pdb_input.biomol)
-
-        biomol.atom_positions[~biomol.atom_mask.astype(bool)] = 0.0
-        biomol.atom_positions[biomol.atom_mask.astype(bool)] = np_cast(atom_pos)
-
-        biomol.b_factors[~biomol.atom_mask.astype(bool)] = 0.0
-        biomol.b_factors[biomol.atom_mask.astype(bool)] = np_cast(plddt)
-
-        mmcif_string = to_inference_mmcif(
-            biomol,
-            f"{input_id}_rank{rank + 1}",
-            return_only_atom_site_records=sample_trajectory and rank > 0,
-            model_number=rank + 1 if sample_trajectory else 1,
-            # NOTE: for visualizing per-atom plDDT scores, we reference the last model number
-            confidence_model_number=num_sample_structures if sample_trajectory else None,
-        )
-
-        if sample_trajectory and rank == 0:
-            mmcif_string = "\n".join(mmcif_string.split("\n")[:-2]) + "\n"
-        elif sample_trajectory and rank > 0:
-            traj_loop_end = "#\n" if rank == num_sample_structures - 1 else ""
-            mmcif_string = (
-                "\n".join(
-                    [
-                        line
-                        for line in mmcif_string.split("\n")
-                        if line.startswith("ATOM") or line.startswith("HETATM")
-                    ]
+        global megafold
+        if not_exists(megafold):
+            with nvtx_range("inference.model.load"):
+                megafold = MegaFold.init_and_load(
+                    checkpoint_path, load_ema_weights=load_ema_weights
                 )
-                + "\n"
-                + traj_loop_end
+
+                if use_cuda and torch.cuda.is_available():
+                    megafold = megafold.cuda()
+
+                megafold.eval()
+
+        with torch.no_grad(), nvtx_range("inference.model.forward"):
+            (
+                sampled_atom_pos,
+                sample_logits,
+            ), sample_atom_dict = megafold.forward_with_megafold_inputs(
+                [pdb_input] * num_sample_structures,
+                dtype=INFERENCE_DTYPE,
+                return_atom_dict=True,
+                return_loss=False,
+                return_confidence_head_logits=True,
+                num_sample_steps=num_sample_steps,
+                num_recycling_steps=num_recycling_steps,
+                return_all_diffused_atom_pos=sample_trajectory,
+                use_optimized_evo=use_optimized_evo,
             )
 
-        mmcif_output_suffix = "_traj" if sample_trajectory else f"_rank{rank + 1}"
-        mmcif_output_path = output.replace(".cif", f"{mmcif_output_suffix}.cif")
+        with nvtx_range("inference.output.postprocess"):
+            if sample_trajectory:
+                num_sample_structures = len(sampled_atom_pos)
+                sampled_atom_pos = sampled_atom_pos.squeeze(-3)
+                sample_logits = sample_logits.to("cpu").repeat(num_sample_structures)
+            else:
+                with nvtx_range("inference.output.rank"):
+                    sampled_atom_pos, sample_logits = rank_structures(
+                        sampled_atom_pos, sample_logits, sample_atom_dict, device="cpu"
+                    )
 
-        logits_output_path = mmcif_output_path.replace(".cif", "_logits")
+            os.makedirs(os.path.dirname(output), exist_ok=True)
 
-        if sample_trajectory and rank == 0 and os.path.exists(mmcif_output_path):
-            os.remove(mmcif_output_path)
+            for rank in range(num_sample_structures):
+                with nvtx_range(f"inference.output.rank_{rank}"):
+                    atom_pos = sampled_atom_pos[rank]
+                    plddt = ComputeConfidenceScore.compute_plddt(
+                        sample_logits.plddt[rank : rank + 1]
+                    ).squeeze(0)
 
-        with open(mmcif_output_path, "a" if sample_trajectory else "w") as f:
-            f.write(mmcif_string)
+                    biomol = copy.deepcopy(pdb_input.biomol)
 
-        if (sample_trajectory and rank == num_sample_structures - 1) or not sample_trajectory:
-            np.savez(
-                logits_output_path,
-                pae=np_cast(sample_logits.pae[rank]),
-                pde=np_cast(sample_logits.pde[rank]),
-                plddt=np_cast(sample_logits.plddt[rank]),
-                resolved=np_cast(sample_logits.resolved[rank]),
-                affinity=np_cast(sample_logits.affinity[rank]),
-            )
+                    biomol.atom_positions[~biomol.atom_mask.astype(bool)] = 0.0
+                    biomol.atom_positions[biomol.atom_mask.astype(bool)] = np_cast(atom_pos)
 
-            print(
-                f"mmCIF file and confidence head logits for rank {rank + 1} saved to {mmcif_output_path} and {logits_output_path + '.npz'}, respectively."
-            )
+                    biomol.b_factors[~biomol.atom_mask.astype(bool)] = 0.0
+                    biomol.b_factors[biomol.atom_mask.astype(bool)] = np_cast(plddt)
+
+                    with nvtx_range(f"inference.output.rank_{rank}.mmcif"):
+                        mmcif_string = to_inference_mmcif(
+                            biomol,
+                            f"{input_id}_rank{rank + 1}",
+                            return_only_atom_site_records=sample_trajectory and rank > 0,
+                            model_number=rank + 1 if sample_trajectory else 1,
+                            confidence_model_number=(
+                                num_sample_structures if sample_trajectory else None
+                            ),
+                        )
+
+                    if sample_trajectory and rank == 0:
+                        mmcif_string = "\n".join(mmcif_string.split("\n")[:-2]) + "\n"
+                    elif sample_trajectory and rank > 0:
+                        traj_loop_end = "#\n" if rank == num_sample_structures - 1 else ""
+                        mmcif_string = (
+                            "\n".join(
+                                [
+                                    line
+                                    for line in mmcif_string.split("\n")
+                                    if line.startswith("ATOM") or line.startswith("HETATM")
+                                ]
+                            )
+                            + "\n"
+                            + traj_loop_end
+                        )
+
+                    mmcif_output_suffix = "_traj" if sample_trajectory else f"_rank{rank + 1}"
+                    mmcif_output_path = output.replace(".cif", f"{mmcif_output_suffix}.cif")
+
+                    logits_output_path = mmcif_output_path.replace(".cif", "_logits")
+
+                    if sample_trajectory and rank == 0 and os.path.exists(mmcif_output_path):
+                        os.remove(mmcif_output_path)
+
+                    with nvtx_range(f"inference.output.rank_{rank}.write"):
+                        with open(mmcif_output_path, "a" if sample_trajectory else "w") as f:
+                            f.write(mmcif_string)
+
+                        if (sample_trajectory and rank == num_sample_structures - 1) or not sample_trajectory:
+                            np.savez(
+                                logits_output_path,
+                                pae=np_cast(sample_logits.pae[rank]),
+                                pde=np_cast(sample_logits.pde[rank]),
+                                plddt=np_cast(sample_logits.plddt[rank]),
+                                resolved=np_cast(sample_logits.resolved[rank]),
+                                affinity=np_cast(sample_logits.affinity[rank]),
+                            )
+
+                            print(
+                                f"mmCIF file and confidence head logits for rank {rank + 1} saved to {mmcif_output_path} and {logits_output_path + '.npz'}, respectively."
+                            )
 
 
 if __name__ == "__main__":
