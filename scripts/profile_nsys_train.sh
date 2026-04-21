@@ -142,5 +142,3 @@ MEGAFOLD_MAX_STEPS="${EFFECTIVE_MAX_STEPS}" \
     --config "${CONFIG}" \
     --trainer_name "${TRAINER_NAME}" \
     "${EXTRA_ARGS[@]}"
-
-echo "Trace written to ${OUTPUT_PATH}.nsys-rep"
