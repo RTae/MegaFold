@@ -108,6 +108,33 @@ def nvtx_range(message: str):
         nvtx.range_pop()
 
 
+def capture_step() -> int | None:
+    value = os.environ.get("MEGAFOLD_CAPTURE_STEP", "")
+    if value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"Ignoring invalid MEGAFOLD_CAPTURE_STEP={value!r}.")
+        return None
+
+
+@contextmanager
+def cuda_profiler_capture_for_step(step: int):
+    target_step = capture_step()
+    if target_step is None or target_step != step or not torch.cuda.is_available():
+        yield
+        return
+
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStart()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+
+
 def seed_everything(seed: int):
     """
     Seed all random number generators for reproducibility.
@@ -1349,7 +1376,9 @@ class Trainer:
                 break
             self.model.train()
 
-            with nvtx_range(f"train.step_{self.steps}"):
+            with cuda_profiler_capture_for_step(self.steps), nvtx_range(
+                f"train.step_{self.steps}"
+            ):
                 grad_accum_iter += 1
                 is_accumulating = grad_accum_iter < self.grad_accum_every
 

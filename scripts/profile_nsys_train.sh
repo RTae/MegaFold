@@ -104,10 +104,12 @@ done
 
 mkdir -p "${OUTPUT_DIR}"
 
+CAPTURE_MODE="nvtx"
 CAPTURE_LABEL="train"
 EFFECTIVE_MAX_STEPS="${MAX_STEPS}"
 
 if [[ -n "${CAPTURE_STEP}" ]]; then
+    CAPTURE_MODE="cudaProfilerApi"
     CAPTURE_LABEL="train.step_${CAPTURE_STEP}"
     min_steps=$((CAPTURE_STEP + 1))
     if [[ "${EFFECTIVE_MAX_STEPS}" == "0" || "${EFFECTIVE_MAX_STEPS}" -lt "${min_steps}" ]]; then
@@ -156,17 +158,30 @@ if [[ -n "${CAPTURE_STEP}" ]]; then
 fi
 echo "  Report: ${OUTPUT_PATH}.nsys-rep"
 
+NSYS_ARGS=(
+    profile
+    --trace=cuda,nvtx,osrt,cublas,cudnn
+    --sample=none
+    --cpuctxsw=none
+    --wait=all
+    --trace-fork-before-exec=true
+    --capture-range="${CAPTURE_MODE}"
+    --capture-range-end=stop
+    --force-overwrite=true
+    -o "${OUTPUT_PATH}"
+)
+
+if [[ "${CAPTURE_MODE}" == "nvtx" ]]; then
+    NSYS_ARGS+=(--nvtx-capture="${CAPTURE_LABEL}")
+fi
+
 MEGAFOLD_NVTX=1 \
 MEGAFOLD_MAX_STEPS="${EFFECTIVE_MAX_STEPS}" \
-"${NSYS_CMD}" profile \
-    --trace=cuda,nvtx,osrt,cublas,cudnn \
-    --sample=none \
-    --cpuctxsw=none \
-    --wait=all \
-    --trace-fork-before-exec=true \
-    --capture-range=nvtx \
-    --capture-range-end=stop \
-    --nvtx-capture="${CAPTURE_LABEL}" \
-    --force-overwrite=true \
-    -o "${OUTPUT_PATH}" \
+MEGAFOLD_CAPTURE_STEP="${CAPTURE_STEP}" \
+"${NSYS_CMD}" "${NSYS_ARGS[@]}" \
     "${TRAIN_CMD[@]}"
+
+if [[ ! -f "${OUTPUT_PATH}.nsys-rep" ]]; then
+    echo "Nsight Systems did not generate ${OUTPUT_PATH}.nsys-rep." >&2
+    exit 1
+fi
