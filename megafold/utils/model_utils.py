@@ -98,31 +98,6 @@ def maybe_emit_nvtx(record_shapes: bool = False):
         yield
 
 
-def cuda_linalg_backend_override() -> str | None:
-    value = os.environ.get("MEGAFOLD_CUDA_LINALG_BACKEND", "magma").strip().lower()
-    if value in {"", "default", "none"}:
-        return None
-    return value
-
-
-@contextmanager
-def preferred_cuda_linalg_backend(device: torch.device | str):
-    device = torch.device(device)
-    preferred_linalg_library = getattr(torch.backends.cuda, "preferred_linalg_library", None)
-    backend = cuda_linalg_backend_override()
-
-    if device.type != "cuda" or not callable(preferred_linalg_library) or backend is None:
-        yield
-        return
-
-    previous_backend = preferred_linalg_library()
-    try:
-        preferred_linalg_library(backend)
-        yield
-    finally:
-        preferred_linalg_library(previous_backend)
-
-
 def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pair_bias") -> None:
     """Optionally dump a pair-bias tensor and a few structural summary stats."""
     capture_dir = os.environ.get("MEGAFOLD_PAIR_BIAS_DIR")
@@ -1076,6 +1051,70 @@ def weighted_rigid_align(
     :return: The optimally aligned true coordinates.
     """
 
+    def _quaternion_to_rotation_matrix(quaternion: Tensor) -> Tensor:
+        quaternion = quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        qw, qx, qy, qz = quaternion.unbind(dim=-1)
+
+        two = quaternion.new_tensor(2.0)
+        rot_matrix = torch.stack(
+            (
+                1 - two * (qy * qy + qz * qz),
+                two * (qx * qy - qz * qw),
+                two * (qx * qz + qy * qw),
+                two * (qx * qy + qz * qw),
+                1 - two * (qx * qx + qz * qz),
+                two * (qy * qz - qx * qw),
+                two * (qx * qz - qy * qw),
+                two * (qy * qz + qx * qw),
+                1 - two * (qx * qx + qy * qy),
+            ),
+            dim=-1,
+        )
+        return rearrange(rot_matrix, "b (i j) -> b i j", i=3, j=3)
+
+    def _rotation_from_covariance(cov_matrix: Tensor) -> Tensor:
+        batch_size = cov_matrix.shape[0]
+        trace = torch.diagonal(cov_matrix, dim1=-2, dim2=-1).sum(dim=-1)
+        sym_cov = cov_matrix + cov_matrix.transpose(-2, -1)
+
+        z = torch.stack(
+            (
+                cov_matrix[:, 1, 2] - cov_matrix[:, 2, 1],
+                cov_matrix[:, 2, 0] - cov_matrix[:, 0, 2],
+                cov_matrix[:, 0, 1] - cov_matrix[:, 1, 0],
+            ),
+            dim=-1,
+        )
+
+        k_matrix = torch.zeros((batch_size, 4, 4), dtype=cov_matrix.dtype, device=cov_matrix.device)
+        k_matrix[:, 0, 0] = trace
+        k_matrix[:, 0, 1:] = z
+        k_matrix[:, 1:, 0] = z
+
+        eye = torch.eye(3, dtype=cov_matrix.dtype, device=cov_matrix.device)
+        k_matrix[:, 1:, 1:] = sym_cov - trace[:, None, None] * eye
+
+        quaternion = torch.zeros((batch_size, 4), dtype=cov_matrix.dtype, device=cov_matrix.device)
+        quaternion[:, 0] = 1.0
+
+        for _ in range(16):
+            quaternion = torch.einsum("bij,bj->bi", k_matrix, quaternion)
+            quaternion = quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        rotation = _quaternion_to_rotation_matrix(quaternion)
+        det = (
+            rotation[:, 0, 0] * (rotation[:, 1, 1] * rotation[:, 2, 2] - rotation[:, 1, 2] * rotation[:, 2, 1])
+            - rotation[:, 0, 1] * (rotation[:, 1, 0] * rotation[:, 2, 2] - rotation[:, 1, 2] * rotation[:, 2, 0])
+            + rotation[:, 0, 2] * (rotation[:, 1, 0] * rotation[:, 2, 1] - rotation[:, 1, 1] * rotation[:, 2, 0])
+        )
+
+        if (det < 0).any():
+            reflection_fix = eye.unsqueeze(0).repeat(batch_size, 1, 1)
+            reflection_fix[:, -1, -1] = torch.where(det < 0, -1.0, 1.0)
+            rotation = torch.einsum("bij,bjk->bik", rotation, reflection_fix)
+
+        return rotation
+
     def _weighted_rigid_align_impl(
         pred_coords_: Tensor,
         true_coords_: Tensor,
@@ -1119,28 +1158,7 @@ def weighted_rigid_align(
         cov_matrix = einsum(
             weights_ * true_coords_centered, pred_coords_centered, "b n i, b n j -> b i j"
         )
-
-        # Use the modern linalg API so CUDA backend selection and fallback behavior are consistent.
-        U, S, Vh = torch.linalg.svd(cov_matrix, full_matrices=False)
-        V = Vh.transpose(-2, -1)
-        U_T = U.transpose(-2, -1)
-
-        # Catch ambiguous rotation by checking the magnitude of singular values
-        if (S.abs() <= 1e-15).any() and not (num_points < (dim + 1)):
-            logger.warning(
-                "Warning: Excessively low rank of "
-                + "cross-correlation between aligned point clouds. "
-                + "`weighted_rigid_align()` cannot return a unique rotation."
-            )
-
-        det = torch.det(einsum(V, U_T, "b i j, b j k -> b i k"))
-
-        # Ensure proper rotation matrix with determinant 1
-        diag = torch.eye(dim, dtype=det.dtype, device=det.device)
-        diag = repeat(diag, "i j -> b i j", b=batch_size).clone()
-
-        diag[:, -1, -1] = det
-        rot_matrix = einsum(V, diag, U_T, "b i j, b j k, b k l -> b i l")
+        rot_matrix = _rotation_from_covariance(cov_matrix)
 
         # Apply the rotation and translation
         true_aligned_coords = (
@@ -1155,34 +1173,10 @@ def weighted_rigid_align(
         return true_aligned_coords
 
     try:
-        with preferred_cuda_linalg_backend(pred_coords.device):
-            return _weighted_rigid_align_impl(pred_coords, true_coords, weights, mask)
+        return _weighted_rigid_align_impl(pred_coords, true_coords, weights, mask)
     except RuntimeError as err:
         err_msg = str(err).lower()
         logger.error(f"Error in weighted_rigid_align: {err_msg}")
-        is_linalg_backend_error = any(
-            token in err_msg
-            for token in (
-                "cublas",
-                "cusolver",
-                "preferred_linalg_library",
-                "linalg",
-                "svd",
-                "magma",
-            )
-        )
-        if not is_linalg_backend_error:
-            raise
-
-        backend = cuda_linalg_backend_override()
-        if pred_coords.device.type == "cuda":
-            raise SystemError(
-                "weighted_rigid_align failed on CUDA linear algebra while staying on GPU. "
-                f"Current backend override: {backend or 'default'}. "
-                "Try setting MEGAFOLD_CUDA_LINALG_BACKEND=magma or MEGAFOLD_CUDA_LINALG_BACKEND=default, "
-                "and verify your CUDA driver / PyTorch build are compatible."
-            ) from err
-
         raise SystemError(err_msg) from err
 
 

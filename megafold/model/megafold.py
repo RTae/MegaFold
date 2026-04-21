@@ -9889,6 +9889,8 @@ class MegaFold(Module):
                             ligand_loss_weight=self.ligand_loss_weight,
                         )
 
+                        mini_aligned_atom_pos = atom_pos.type(sampling_dtype)
+
                         try:
                             mini_aligned_atom_pos = weighted_rigid_align(
                                 pred_coords=denoised_atom_pos.float(),
@@ -9897,8 +9899,9 @@ class MegaFold(Module):
                                 mask=atom_mask,
                             ).type(sampling_dtype)
                         except Exception as e:
-                            # NOTE: For many (random) unit test inputs, weighted rigid alignment can be unstable
-                            logger.warning(f"Skipping weighted rigid alignment due to: {e}")
+                            logger.warning(
+                                f"Skipping weighted rigid alignment due to: {e}; using unaligned atom_pos as fallback."
+                            )
 
                         # section 4.2 - multi-chain permutation alignment
 
