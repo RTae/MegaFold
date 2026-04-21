@@ -170,5 +170,3 @@ MEGAFOLD_MAX_STEPS="${EFFECTIVE_MAX_STEPS}" \
     --force-overwrite=true \
     -o "${OUTPUT_PATH}" \
     "${TRAIN_CMD[@]}"
-
-echo "Trace written to ${OUTPUT_PATH}.nsys-rep"
