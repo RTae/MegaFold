@@ -5,7 +5,7 @@ This repo already had Nsight Compute support. This file covers tracing the real 
 ## What was added
 
 - `train.py` now emits a top-level NVTX range named `train` when `MEGAFOLD_NVTX=1`.
-- `megafold/trainer.py` now emits nested NVTX ranges for dataloader, forward, backward, optimizer, EMA, zero-grad, scheduler, and validation.
+- `megafold/trainer.py` now emits a step-level NVTX range named `train.step_N`, plus nested ranges for dataloader, forward, backward, optimizer, EMA, zero-grad, and scheduler.
 - `scripts/profile_nsys_train.sh` launches `nsys` against the normal DeepSpeed training entrypoint.
 
 ## Recommended first trace
@@ -23,9 +23,29 @@ That defaults to:
 - max steps: `3`
 - output dir: `nsys_reports/`
 
+## Capture exactly one steady-state step
+
+If you want to skip the noisy first step and capture only a later training step, use `--capture-step`.
+
+```bash
+# Capture only training step 1, but allow the job to run long enough to reach it
+scripts/profile_nsys_train.sh --capture-step 1 --output steady_state_step1
+```
+
+Step indices are zero-based:
+
+- `--capture-step 0` captures the first training step
+- `--capture-step 1` captures the second training step
+- `--capture-step 2` captures the third training step
+
+When `--capture-step N` is set, the wrapper automatically increases `MEGAFOLD_MAX_STEPS` to at least `N + 1` if needed.
+
 ## Common examples
 
 ```bash
+# Capture only the second training step on the smoke config
+scripts/profile_nsys_train.sh --capture-step 1 --output smoke_step1
+
 # 5 optimizer steps on the smoke config
 scripts/profile_nsys_train.sh --max-steps 5 --output smoke_5steps
 
@@ -50,14 +70,14 @@ If you want to run `nsys` directly instead of using the wrapper:
 
 ```bash
 MEGAFOLD_NVTX=1 \
-MEGAFOLD_MAX_STEPS=3 \
+MEGAFOLD_MAX_STEPS=2 \
 nsys profile \
   --trace=cuda,nvtx,osrt,cublas,cudnn \
   --sample=none \
   --cpuctxsw=none \
   --wait=all \
   --capture-range=nvtx \
-  --nvtx-capture=train \
+  --nvtx-capture=train.step_1 \
   --stop-on-range-end=true \
   --force-overwrite=true \
   -o nsys_reports/manual_trace \
@@ -70,7 +90,8 @@ nsys profile \
 
 - Keep the YAML field `profile: false` when using `nsys`. That field enables PyTorch profiler, which is a different tool and adds extra overhead.
 - `MEGAFOLD_MAX_STEPS` is an environment override for short debug or tracing runs. Set it to `0` to disable the limit.
-- The wrapper captures only the NVTX range named `train`, so Python startup and DeepSpeed launcher setup stay out of the final trace.
+- By default the wrapper captures the NVTX range named `train`, so Python startup and DeepSpeed launcher setup stay out of the final trace.
+- With `--capture-step N`, the wrapper captures only the NVTX range `train.step_N`, which gives you one exact training step instead of the whole run.
 
 ## Opening the report
 

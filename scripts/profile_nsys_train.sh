@@ -11,6 +11,7 @@ CONFIG="configs/megafold_1x1_smoke.yaml"
 TRAINER_NAME="initial_training"
 NUM_GPUS=1
 MAX_STEPS="${MEGAFOLD_MAX_STEPS:-3}"
+CAPTURE_STEP=""
 MASTER_PORT="${MASTER_PORT:-29517}"
 OUTPUT_NAME=""
 EXTRA_ARGS=()
@@ -24,11 +25,13 @@ Options:
   --trainer-name NAME   Trainer name inside the YAML.
   --gpus N              Number of GPUs for DeepSpeed.
   --max-steps N         Stop after N optimizer steps. Use 0 for no limit.
+    --capture-step N      Capture only NVTX range for optimizer step N.
   --output NAME         Output basename under nsys_reports/.
   --help                Show this message.
 
 Examples:
   scripts/profile_nsys_train.sh
+    scripts/profile_nsys_train.sh --capture-step 1 --output steady_state_step1
   scripts/profile_nsys_train.sh --max-steps 5 --output smoke_trace
   scripts/profile_nsys_train.sh --config configs/megafold_1x1.yaml --gpus 1 --max-steps 10
   scripts/profile_nsys_train.sh --config configs/megafold_1x2.yaml --gpus 2 --max-steps 4
@@ -51,6 +54,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max-steps)
             MAX_STEPS="$2"
+            shift 2
+            ;;
+        --capture-step)
+            CAPTURE_STEP="$2"
             shift 2
             ;;
         --output)
@@ -76,10 +83,25 @@ done
 
 mkdir -p "${OUTPUT_DIR}"
 
+CAPTURE_LABEL="train"
+EFFECTIVE_MAX_STEPS="${MAX_STEPS}"
+
+if [[ -n "${CAPTURE_STEP}" ]]; then
+    CAPTURE_LABEL="train.step_${CAPTURE_STEP}"
+    min_steps=$((CAPTURE_STEP + 1))
+    if [[ "${EFFECTIVE_MAX_STEPS}" == "0" || "${EFFECTIVE_MAX_STEPS}" -lt "${min_steps}" ]]; then
+        EFFECTIVE_MAX_STEPS="${min_steps}"
+    fi
+fi
+
 if [[ -z "${OUTPUT_NAME}" ]]; then
     config_name="$(basename "${CONFIG}" .yaml)"
     timestamp="$(date +%Y%m%d_%H%M%S)"
-    OUTPUT_NAME="${config_name}_g${NUM_GPUS}_s${MAX_STEPS}_${timestamp}"
+    if [[ -n "${CAPTURE_STEP}" ]]; then
+        OUTPUT_NAME="${config_name}_g${NUM_GPUS}_cap${CAPTURE_STEP}_s${EFFECTIVE_MAX_STEPS}_${timestamp}"
+    else
+        OUTPUT_NAME="${config_name}_g${NUM_GPUS}_s${EFFECTIVE_MAX_STEPS}_${timestamp}"
+    fi
 fi
 
 OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_NAME}"
@@ -88,18 +110,21 @@ echo "Tracing MegaFold training with Nsight Systems"
 echo "  Config: ${CONFIG}"
 echo "  Trainer: ${TRAINER_NAME}"
 echo "  GPUs: ${NUM_GPUS}"
-echo "  Max steps: ${MAX_STEPS}"
+echo "  Max steps: ${EFFECTIVE_MAX_STEPS}"
+if [[ -n "${CAPTURE_STEP}" ]]; then
+    echo "  Capture step: ${CAPTURE_STEP}"
+fi
 echo "  Report: ${OUTPUT_PATH}.nsys-rep"
 
 MEGAFOLD_NVTX=1 \
-MEGAFOLD_MAX_STEPS="${MAX_STEPS}" \
+MEGAFOLD_MAX_STEPS="${EFFECTIVE_MAX_STEPS}" \
 "${NSYS_CMD}" profile \
     --trace=cuda,nvtx,osrt,cublas,cudnn \
     --sample=none \
     --cpuctxsw=none \
     --wait=all \
     --capture-range=nvtx \
-    --nvtx-capture=train \
+    --nvtx-capture="${CAPTURE_LABEL}" \
     --stop-on-range-end=true \
     --force-overwrite=true \
     -o "${OUTPUT_PATH}" \
