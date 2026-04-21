@@ -1,6 +1,6 @@
 ---
 # conductor parameters
-checkpoint_folder: ./outputs/smoke-test
+checkpoint_folder: ./outputs/smoke_test
 checkpoint_prefix: megafold.
 training_order:
   - initial_training
@@ -57,7 +57,7 @@ model:
 training:
   initial_training:
     # trainer parameters
-    num_train_steps: 200
+    num_train_steps: 300
     num_valid_steps: 20
     num_test_steps: null
     global_batch_size: 1 ## = data_parallel_size

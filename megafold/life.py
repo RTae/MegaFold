@@ -29,6 +29,7 @@ import os
 import gemmi
 import rdkit.Geometry.rdGeometry as rdGeometry
 import torch
+import wrapt_timeout_decorator
 from beartype.typing import Literal
 from rdkit.Chem import AllChem as Chem
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
@@ -36,6 +37,20 @@ from rdkit.Chem.rdchem import Mol
 
 from megafold.tensor_typing import Int, typecheck
 from megafold.utils.utils import exists
+
+
+RDKIT_EMBED_MAX_SECONDS = float(os.environ.get("MEGAFOLD_RDKIT_EMBED_MAX_SECONDS", "5.0"))
+RDKIT_EMBED_MAX_ITERATIONS = int(os.environ.get("MEGAFOLD_RDKIT_EMBED_MAX_ITERATIONS", "200"))
+RDKIT_EMBED_NUM_THREADS = int(os.environ.get("MEGAFOLD_RDKIT_EMBED_NUM_THREADS", "1"))
+
+
+@wrapt_timeout_decorator.timeout(
+    RDKIT_EMBED_MAX_SECONDS,
+    use_signals=True,
+    timeout_exception=TimeoutError,
+)
+def _embed_molecule_with_timeout(mol: Mol, ps: rdDistGeom.EmbedParameters) -> int:
+    return rdDistGeom.EmbedMolecule(mol, ps)
 
 
 def is_unique(arr):
@@ -471,15 +486,18 @@ def generate_conformation(mol: Mol, sanitize: bool = True) -> Mol:
     """Generate a conformation for a molecule using ETKDGv3."""
     mol = Chem.AddHs(mol)
     ps = rdDistGeom.ETKDGv3()
+    ps.maxIterations = RDKIT_EMBED_MAX_ITERATIONS
+    ps.numThreads = RDKIT_EMBED_NUM_THREADS
+    ps.timeout = max(1, int(RDKIT_EMBED_MAX_SECONDS))
 
-    conf_id = rdDistGeom.EmbedMolecule(mol, ps)
+    conf_id = _embed_molecule_with_timeout(mol, ps)
     if conf_id == -1:
         ps.useRandomCoords = True
-        conf_id = rdDistGeom.EmbedMolecule(mol, ps)
+        conf_id = _embed_molecule_with_timeout(mol, ps)
     if conf_id == -1:
         # See https://github.com/rdkit/rdkit/discussions/5841 for more details
         ps.useBasicKnowledge = False
-        conf_id = rdDistGeom.EmbedMolecule(mol, ps)
+        conf_id = _embed_molecule_with_timeout(mol, ps)
         conf_id = rdForceFieldHelpers.MMFFOptimizeMolecule(mol)
     if conf_id == -1:
         raise ValueError("ETKDGv3 failed to generate a conformation for the input molecule.")
