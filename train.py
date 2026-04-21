@@ -26,11 +26,32 @@
 
 import argparse
 import os
+from contextlib import contextmanager
 
 import torch
 from loguru import logger
 
 from megafold.configs import create_trainer_from_conductor_yaml
+
+
+def _nvtx_enabled() -> bool:
+    value = os.environ.get("MEGAFOLD_NVTX", "")
+    return value.lower() not in {"", "0", "false", "no"}
+
+
+@contextmanager
+def _nvtx_range(message: str):
+    if not _nvtx_enabled() or not torch.cuda.is_available():
+        yield
+        return
+
+    import torch.cuda.nvtx as nvtx
+
+    nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
 
 
 def main(config_path: str, trainer_name: str):
@@ -46,7 +67,8 @@ def main(config_path: str, trainer_name: str):
     trainer.load_from_checkpoint_folder()
 
     logger.info("Trainer starting!")
-    trainer()
+    with _nvtx_range("train"):
+        trainer()
     logger.info("Trainer finished!")
 
 

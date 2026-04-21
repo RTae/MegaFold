@@ -88,6 +88,26 @@ import numpy as np
 from loguru import logger
 
 
+def nvtx_enabled() -> bool:
+    value = os.environ.get("MEGAFOLD_NVTX", "")
+    return value.lower() not in {"", "0", "false", "no"}
+
+
+@contextmanager
+def nvtx_range(message: str):
+    if not nvtx_enabled() or not torch.cuda.is_available():
+        yield
+        return
+
+    import torch.cuda.nvtx as nvtx
+
+    nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
+
+
 def seed_everything(seed: int):
     """
     Seed all random number generators for reproducibility.
@@ -1319,10 +1339,14 @@ class Trainer:
         prevTime = None
         timeSoFar = [] 
         lossSoFar = [] 
+        debug_max_steps = int(os.environ.get("MEGAFOLD_MAX_STEPS", "0"))
 
         while self.steps < self.num_train_steps:
-            if self.steps == 121: ## Stop at step 121
-                break 
+            if debug_max_steps and self.steps >= debug_max_steps:
+                self.print(
+                    f"Stopping early at step {self.steps} because MEGAFOLD_MAX_STEPS={debug_max_steps}."
+                )
+                break
             self.model.train()
 
             grad_accum_iter += 1
@@ -1345,7 +1369,8 @@ class Trainer:
                 self.print("Memory usage: " + SynchronizedWallClockTimer.memory_usage())
             prevTime = time.time()
 
-            train_batch = next(dl)
+            with nvtx_range(f"train.step_{self.steps}.dataloader"):
+                train_batch = next(dl)
             
             # Move batch to device for distributed training
             if self.use_native_deepspeed_2d or self.using_deepspeed_strategy:
@@ -1388,35 +1413,36 @@ class Trainer:
                     if verbose == "extra":
                         self.print(f"Step {self.steps}, Accum {grad_accum_iter} | Forward pass...")
 
-                    loss, loss_breakdown = timeout(
-                        dec_timeout=FORWARD_MAX_SECONDS_PER_INPUT if self.steps > 0 else 12000, # first step can be slow
-                        use_signals=True,
-                        timeout_exception=BaseException,
-                    )(self.model.__call__)(
-                        **train_batch.dict(),
-                        dtype=self.dtype,
-                        return_loss_breakdown=True,
-                        call_confidence_head=self.steps % self.confidence_head_interval == 0,
-                        # verbose=verbose == "extra",
-                    )
-
-                    print(f"Rank {current_rank} | Memory after forward pass: {SynchronizedWallClockTimer.memory_usage()}")
-
-                    # Pre-backward high memory guard: abort this step when cached memory exceeds 70% of HBM
-                    current_device = (
-                        self.device.index
-                        if isinstance(self.device, torch.device)
-                        else torch.cuda.current_device()
-                    )
-                    total_hbm_bytes = torch.cuda.get_device_properties(current_device).total_memory
-                    threshold_bytes = int(0.7 * total_hbm_bytes)
-                    # memory_cached(), not memory_allocated(), since fairer for pytorch allocator
-                    cached_bytes = torch.cuda.memory_reserved(current_device)
-
-                    if cached_bytes >= threshold_bytes:
-                        raise RuntimeError(
-                            f"PreBackwardHighMemory guard: cached={cached_bytes} bytes >= 70% HBM ({threshold_bytes} bytes)"
+                    with nvtx_range(f"train.step_{self.steps}.forward"):
+                        loss, loss_breakdown = timeout(
+                            dec_timeout=FORWARD_MAX_SECONDS_PER_INPUT if self.steps > 0 else 12000, # first step can be slow
+                            use_signals=True,
+                            timeout_exception=BaseException,
+                        )(self.model.__call__)(
+                            **train_batch.dict(),
+                            dtype=self.dtype,
+                            return_loss_breakdown=True,
+                            call_confidence_head=self.steps % self.confidence_head_interval == 0,
+                            # verbose=verbose == "extra",
                         )
+
+                        print(f"Rank {current_rank} | Memory after forward pass: {SynchronizedWallClockTimer.memory_usage()}")
+
+                        # Pre-backward high memory guard: abort this step when cached memory exceeds 70% of HBM
+                        current_device = (
+                            self.device.index
+                            if isinstance(self.device, torch.device)
+                            else torch.cuda.current_device()
+                        )
+                        total_hbm_bytes = torch.cuda.get_device_properties(current_device).total_memory
+                        threshold_bytes = int(0.7 * total_hbm_bytes)
+                        # memory_cached(), not memory_allocated(), since fairer for pytorch allocator
+                        cached_bytes = torch.cuda.memory_reserved(current_device)
+
+                        if cached_bytes >= threshold_bytes:
+                            raise RuntimeError(
+                                f"PreBackwardHighMemory guard: cached={cached_bytes} bytes >= 70% HBM ({threshold_bytes} bytes)"
+                            )
 
                 except BaseException as e:
                     self.print(
@@ -1498,13 +1524,14 @@ class Trainer:
                         self.print(
                             f"Step {self.steps}, Accum {grad_accum_iter} | Backward pass..."
                         )
-                    if self.use_native_deepspeed_2d:
-                        # Native DeepSpeed 2D handles gradient accumulation internally
-                        self.model_engine.backward(loss)
-                    else:
-                        self.fabric.backward(
-                            loss / (1.0 if self.using_deepspeed_strategy else self.grad_accum_every)
-                        )
+                    with nvtx_range(f"train.step_{self.steps}.backward"):
+                        if self.use_native_deepspeed_2d:
+                            # Native DeepSpeed 2D handles gradient accumulation internally
+                            self.model_engine.backward(loss)
+                        else:
+                            self.fabric.backward(
+                                loss / (1.0 if self.using_deepspeed_strategy else self.grad_accum_every)
+                            )
                 except Exception as e:
                     self.print(
                         f"Step {self.steps}, Accum {grad_accum_iter} | Failing on training batch backward due to exception: {e}, {traceback.format_exc()}"
@@ -1546,11 +1573,12 @@ class Trainer:
                 if verbose == "extra":
                     self.print(f"Step {self.steps} | Optimization...")
 
-                if self.use_native_deepspeed_2d:
-                    # DeepSpeed handles optimizer step
-                    self.model_engine.step()
-                else:
-                    self.model_optimizer.step()
+                with nvtx_range(f"train.step_{self.steps}.optimizer"):
+                    if self.use_native_deepspeed_2d:
+                        # DeepSpeed handles optimizer step
+                        self.model_engine.step()
+                    else:
+                        self.model_optimizer.step()
 
                 # update exponential moving average
 
@@ -1562,8 +1590,9 @@ class Trainer:
                 # device are identical for the current EMA weight update, such that the
                 # rank zero EMA weights can subsequently be treated as global EMA weights
 
-                if self.has_ema:
-                    self.ema_model.update()
+                with nvtx_range(f"train.step_{self.steps}.ema"):
+                    if self.has_ema:
+                        self.ema_model.update()
 
                 # zero gradients
 
@@ -1573,19 +1602,21 @@ class Trainer:
                     if verbose == "extra":
                         self.print(f"Step {self.steps} | Zeroing gradients...")
 
-                    zero_grad()
+                    with nvtx_range(f"train.step_{self.steps}.zero_grad"):
+                        zero_grad()
 
                 # update scheduler
 
                 if verbose == "extra":
                     self.print(f"Step {self.steps} | Scheduler update...")
 
-                if self.use_native_deepspeed_2d:
-                    # DeepSpeed automatically manages scheduler step when lr_scheduler is passed to initialize()
-                    # Do NOT call scheduler.step() manually - DeepSpeed handles it internally
-                    pass
-                else:
-                    self.scheduler.step()
+                with nvtx_range(f"train.step_{self.steps}.scheduler"):
+                    if self.use_native_deepspeed_2d:
+                        # DeepSpeed automatically manages scheduler step when lr_scheduler is passed to initialize()
+                        # Do NOT call scheduler.step() manually - DeepSpeed handles it internally
+                        pass
+                    else:
+                        self.scheduler.step()
 
                 # increment steps
 
@@ -1672,42 +1703,43 @@ class Trainer:
 
                     # set up metric accumulation
 
-                    mean_model_selection_score = MeanMetric(sync_on_compute=True).to(self.device)
-                    mean_top_ranked_lddt = MeanMetric(sync_on_compute=True).to(self.device)
+                    with nvtx_range(f"train.step_{self.steps}.validation"):
+                        mean_model_selection_score = MeanMetric(sync_on_compute=True).to(self.device)
+                        mean_top_ranked_lddt = MeanMetric(sync_on_compute=True).to(self.device)
 
-                    self.wait()
+                        self.wait()
 
-                    if verbose:
-                        self.print("Validating...")
+                        if verbose:
+                            self.print("Validating...")
 
-                    eval_model = default(self.ema_model, self.model)
+                        eval_model = default(self.ema_model, self.model)
 
-                    with torch.no_grad(), to_device_and_back(eval_model, self.device):
-                        eval_model.eval()
+                        with torch.no_grad(), to_device_and_back(eval_model, self.device):
+                            eval_model.eval()
 
-                        for valid_batch_idx, valid_batch in enumerate(self.valid_dataloader):
-                            # Move batch to device for distributed training
-                            if self.use_native_deepspeed_2d or self.using_deepspeed_strategy:
-                                valid_batch = valid_batch.to(self.device)
-                                
-                            if (
-                                exists(self.num_valid_steps)
-                                and valid_batch_idx >= self.num_valid_steps
-                            ):
-                                self.print(
-                                    f"Step {self.steps} |"
-                                    f" Stopping validation early after seeing {self.num_valid_steps} val batches."
-                                )
-                                del valid_batch
-                                garbage_collection_cuda()
-                                break
+                            for valid_batch_idx, valid_batch in enumerate(self.valid_dataloader):
+                                # Move batch to device for distributed training
+                                if self.use_native_deepspeed_2d or self.using_deepspeed_strategy:
+                                    valid_batch = valid_batch.to(self.device)
+                                    
+                                if (
+                                    exists(self.num_valid_steps)
+                                    and valid_batch_idx >= self.num_valid_steps
+                                ):
+                                    self.print(
+                                        f"Step {self.steps} |"
+                                        f" Stopping validation early after seeing {self.num_valid_steps} val batches."
+                                    )
+                                    del valid_batch
+                                    garbage_collection_cuda()
+                                    break
 
-                            if verbose == "extra":
-                                self.print(
-                                    f"Step {self.steps} | Running val step {valid_batch_idx}..."
-                                )
+                                if verbose == "extra":
+                                    self.print(
+                                        f"Step {self.steps} | Running val step {valid_batch_idx}..."
+                                    )
 
-                            # generate multiple samples per example in each batch
+                                # generate multiple samples per example in each batch
 
                             valid_samples: List[Sample] = []
 

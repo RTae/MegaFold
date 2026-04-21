@@ -1,6 +1,6 @@
 ---
 # conductor parameters
-checkpoint_folder: ./outputs/initial-and-fine-tuning
+checkpoint_folder: ./outputs/smoke-test
 checkpoint_prefix: megafold.
 training_order:
   - initial_training
