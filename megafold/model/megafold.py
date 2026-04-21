@@ -185,6 +185,7 @@ from megafold.utils.model_utils import (
     mean_pool_fixed_windows_with_mask,
     mean_pool_with_lens,
     maybe_capture_pair_bias,
+    maybe_emit_nvtx,
     pack_one,
     pad_and_window,
     pad_or_slice_to,
@@ -195,6 +196,7 @@ from megafold.utils.model_utils import (
     sum_pool_with_lens,
     symmetrize,
     to_pairwise_mask,
+    nvtx_range,
     weighted_rigid_align,
 )
 from megafold.utils.utils import (
@@ -5129,7 +5131,7 @@ class AtomPermutationAlignment(Module):
             if torch.cuda.is_available()
             else nullcontext()
         )
-        with amp_context:
+        with amp_context, maybe_emit_nvtx():
             per_res_rmsd = batch_compute_rmsd(
                 true_pos=permuted_coords.float(),
                 pred_pos=pred_coords.float(),
@@ -9559,42 +9561,43 @@ class MegaFold(Module):
             if verbose:
                 logger.info("Running the main trunk...")
 
-            (
-                atom_feats,
-                atompair_feats,
-                relative_position_encoding,
-                single_inputs,
-                single,
-                pairwise,
-                mask,
-                bond_mask,
-            ) = self.run_trunk(
-                dtype=dtype,
-                atom_inputs=atom_inputs,
-                atompair_inputs=atompair_inputs,
-                additional_molecule_feats=additional_molecule_feats,
-                is_molecule_types=is_molecule_types,
-                molecule_atom_lens=molecule_atom_lens,
-                molecule_ids=molecule_ids,
-                additional_msa_feats=additional_msa_feats,
-                additional_token_feats=additional_token_feats,
-                atom_ids=atom_ids,
-                atompair_ids=atompair_ids,
-                is_molecule_mod=is_molecule_mod,
-                token_bonds=token_bonds,
-                msa=msa,
-                msa_mask=msa_mask,
-                templates=templates,
-                template_mask=template_mask,
-                num_recycling_steps=num_recycling_steps,
-                token_constraints=token_constraints,
-                detach_when_recycling=detach_when_recycling,
-                verbose=verbose,
-                input_independent_baseline=input_independent_baseline,
-                use_optimized_evo=use_optimized_evo,
-                chains=chains,
-                filepath=filepath,
-            )
+            with nvtx_range("model.trunk"):
+                (
+                    atom_feats,
+                    atompair_feats,
+                    relative_position_encoding,
+                    single_inputs,
+                    single,
+                    pairwise,
+                    mask,
+                    bond_mask,
+                ) = self.run_trunk(
+                    dtype=dtype,
+                    atom_inputs=atom_inputs,
+                    atompair_inputs=atompair_inputs,
+                    additional_molecule_feats=additional_molecule_feats,
+                    is_molecule_types=is_molecule_types,
+                    molecule_atom_lens=molecule_atom_lens,
+                    molecule_ids=molecule_ids,
+                    additional_msa_feats=additional_msa_feats,
+                    additional_token_feats=additional_token_feats,
+                    atom_ids=atom_ids,
+                    atompair_ids=atompair_ids,
+                    is_molecule_mod=is_molecule_mod,
+                    token_bonds=token_bonds,
+                    msa=msa,
+                    msa_mask=msa_mask,
+                    templates=templates,
+                    template_mask=template_mask,
+                    num_recycling_steps=num_recycling_steps,
+                    token_constraints=token_constraints,
+                    detach_when_recycling=detach_when_recycling,
+                    verbose=verbose,
+                    input_independent_baseline=input_independent_baseline,
+                    use_optimized_evo=use_optimized_evo,
+                    chains=chains,
+                    filepath=filepath,
+                )
 
             # prepare to maybe predict ligand binding affinities
 
@@ -9647,25 +9650,26 @@ class MegaFold(Module):
                 logger.info("Sampling atomic coordinates...")
 
             if not return_loss:
-                sampled_atom_pos = autocasting_disable_decorator(self.disable_sampling_casting)(
-                    self.edm.sample
-                )(
-                    num_sample_steps=num_sample_steps,
-                    atom_feats=atom_feats,
-                    atompair_feats=atompair_feats,
-                    atom_parent_ids=atom_parent_ids,
-                    atom_mask=atom_mask,
-                    mask=mask,
-                    single_trunk_repr=single,
-                    single_inputs_repr=single_inputs,
-                    pairwise_trunk=pairwise,
-                    pairwise_rel_pos_feats=relative_position_encoding,
-                    molecule_atom_lens=molecule_atom_lens,
-                    is_molecule_types=is_molecule_types,
-                    additional_molecule_feats=additional_molecule_feats,
-                    return_all_timesteps=return_all_diffused_atom_pos,
-                    use_optimized_evo=use_optimized_evo,
-                )
+                with nvtx_range("model.sample"):
+                    sampled_atom_pos = autocasting_disable_decorator(
+                        self.disable_sampling_casting
+                    )(self.edm.sample)(
+                        num_sample_steps=num_sample_steps,
+                        atom_feats=atom_feats,
+                        atompair_feats=atompair_feats,
+                        atom_parent_ids=atom_parent_ids,
+                        atom_mask=atom_mask,
+                        mask=mask,
+                        single_trunk_repr=single,
+                        single_inputs_repr=single_inputs,
+                        pairwise_trunk=pairwise,
+                        pairwise_rel_pos_feats=relative_position_encoding,
+                        molecule_atom_lens=molecule_atom_lens,
+                        is_molecule_types=is_molecule_types,
+                        additional_molecule_feats=additional_molecule_feats,
+                        return_all_timesteps=return_all_diffused_atom_pos,
+                        use_optimized_evo=use_optimized_evo,
+                    )
 
                 if exists(atom_mask):
                     # sampled_atom_pos = einx.where(
@@ -9716,33 +9720,35 @@ class MegaFold(Module):
                     # diffused atom positions are used for sake of memory
                     ch_atom_pos_input = ch_atom_pos_input[0]
 
-                confidence_head_logits = autocasting_disable_decorator(
-                    self.disable_confidence_casting
-                )(self.confidence_head.__call__)(
-                    single_repr=ch_single,
-                    single_inputs_repr=ch_single_inputs,
-                    pairwise_repr=ch_pairwise,
-                    pred_atom_pos=ch_atom_pos_input,
-                    molecule_atom_indices=ch_molecule_atom_indices,
-                    molecule_atom_lens=ch_molecule_atom_lens,
-                    is_ligand_atom_res_idx=ch_is_ligand_atom_res_idx,
-                    atom_feats=ch_atom_feats,
-                    mask=ch_mask,
-                    num_ligands=ch_num_ligands,
-                    return_pae_logits=True,
-                    use_optimized_evo=use_optimized_evo,
-                )
+                with nvtx_range("model.confidence_head"):
+                    confidence_head_logits = autocasting_disable_decorator(
+                        self.disable_confidence_casting
+                    )(self.confidence_head.__call__)(
+                        single_repr=ch_single,
+                        single_inputs_repr=ch_single_inputs,
+                        pairwise_repr=ch_pairwise,
+                        pred_atom_pos=ch_atom_pos_input,
+                        molecule_atom_indices=ch_molecule_atom_indices,
+                        molecule_atom_lens=ch_molecule_atom_lens,
+                        is_ligand_atom_res_idx=ch_is_ligand_atom_res_idx,
+                        atom_feats=ch_atom_feats,
+                        mask=ch_mask,
+                        num_ligands=ch_num_ligands,
+                        return_pae_logits=True,
+                        use_optimized_evo=use_optimized_evo,
+                    )
 
                 returned_logits = confidence_head_logits
 
                 if return_distogram_head_logits:
-                    distogram_head_logits = autocasting_disable_decorator(
-                        self.disable_distogram_casting
-                    )(self.distogram_head.__call__)(
-                        ch_pairwise.clone(),
-                        molecule_atom_lens=ch_molecule_atom_lens,
-                        atom_feats=ch_atom_feats,
-                    )
+                    with nvtx_range("model.distogram_head"):
+                        distogram_head_logits = autocasting_disable_decorator(
+                            self.disable_distogram_casting
+                        )(self.distogram_head.__call__)(
+                            ch_pairwise.clone(),
+                            molecule_atom_lens=ch_molecule_atom_lens,
+                            atom_feats=ch_atom_feats,
+                        )
 
                     returned_logits = MegaFoldLogits(
                         **confidence_head_logits._asdict(), distance=distogram_head_logits
@@ -9771,11 +9777,14 @@ class MegaFold(Module):
                 if verbose:
                     logger.info("Calculating distogram logits...")
 
-                model_preds["distogram"] = autocasting_disable_decorator(
-                    self.disable_distogram_casting
-                )(self.distogram_head.__call__)(
-                    pairwise, molecule_atom_lens=molecule_atom_lens, atom_feats=atom_feats
-                )
+                with nvtx_range("model.distogram_head"):
+                    model_preds["distogram"] = autocasting_disable_decorator(
+                        self.disable_distogram_casting
+                    )(self.distogram_head.__call__)(
+                        pairwise,
+                        molecule_atom_lens=molecule_atom_lens,
+                        atom_feats=atom_feats,
+                    )
                 model_labels["atom_pos"] = (
                     atom_pos if self.disable_distogram_casting else atom_pos.type(dtype)
                 )
@@ -9787,34 +9796,37 @@ class MegaFold(Module):
                 if verbose:
                     logger.info("Calculating diffusion predictions...")
 
-                (
-                    model_preds["denoised_atom_pos"],
-                    model_labels["diffusion_atom_pos_aligned"],
-                    model_labels["diffusion_align_weights"],
-                    model_labels["diffusion_loss_weights"],
-                ) = autocasting_disable_decorator(self.disable_edm_casting)(self.edm.__call__)(
-                    atom_pos_ground_truth=atom_pos,
-                    additional_molecule_feats=additional_molecule_feats,
-                    is_molecule_types=is_molecule_types,
-                    atom_feats=atom_feats,
-                    atompair_feats=atompair_feats,
-                    atom_parent_ids=atom_parent_ids,
-                    missing_atom_mask=missing_atom_mask,
-                    atom_mask=atom_mask,
-                    mask=mask,
-                    single_trunk_repr=single,
-                    single_inputs_repr=single_inputs,
-                    pairwise_trunk=pairwise,
-                    pairwise_rel_pos_feats=relative_position_encoding,
-                    molecule_atom_lens=molecule_atom_lens,
-                    molecule_atom_perms=molecule_atom_perms,
-                    nucleotide_loss_weight=self.nucleotide_loss_weight,
-                    ligand_loss_weight=self.ligand_loss_weight,
-                    filepath=filepath,
-                    single_structure_input=single_structure_input,
-                    use_optimized_evo=use_optimized_evo,
-                    verbose=verbose,
-                )
+                with nvtx_range("model.diffusion_train"):
+                    (
+                        model_preds["denoised_atom_pos"],
+                        model_labels["diffusion_atom_pos_aligned"],
+                        model_labels["diffusion_align_weights"],
+                        model_labels["diffusion_loss_weights"],
+                    ) = autocasting_disable_decorator(self.disable_edm_casting)(
+                        self.edm.__call__
+                    )(
+                        atom_pos_ground_truth=atom_pos,
+                        additional_molecule_feats=additional_molecule_feats,
+                        is_molecule_types=is_molecule_types,
+                        atom_feats=atom_feats,
+                        atompair_feats=atompair_feats,
+                        atom_parent_ids=atom_parent_ids,
+                        missing_atom_mask=missing_atom_mask,
+                        atom_mask=atom_mask,
+                        mask=mask,
+                        single_trunk_repr=single,
+                        single_inputs_repr=single_inputs,
+                        pairwise_trunk=pairwise,
+                        pairwise_rel_pos_feats=relative_position_encoding,
+                        molecule_atom_lens=molecule_atom_lens,
+                        molecule_atom_perms=molecule_atom_perms,
+                        nucleotide_loss_weight=self.nucleotide_loss_weight,
+                        ligand_loss_weight=self.ligand_loss_weight,
+                        filepath=filepath,
+                        single_structure_input=single_structure_input,
+                        use_optimized_evo=use_optimized_evo,
+                        verbose=verbose,
+                    )
             self.diffusionmodule_time.append(time.time() - dm_start)
             self.print(f"Time taken diffusionmodule: {time.time() - dm_start}")
             self.print(f"Memory usage after diffusion module: {SynchronizedWallClockTimer.memory_usage()}")
@@ -9839,7 +9851,7 @@ class MegaFold(Module):
 
                 num_rollout_steps = default(num_rollout_steps, self.num_rollout_steps)
 
-                with torch.no_grad():
+                with torch.no_grad(), nvtx_range("model.confidence_rollout"):
                     denoised_atom_pos = autocasting_disable_decorator(
                         self.disable_sampling_casting
                     )(self.edm.sample)(
@@ -9967,22 +9979,23 @@ class MegaFold(Module):
             if verbose:
                 logger.info("Calculating confidence head logits...")
 
-            ch_logits = autocasting_disable_decorator(self.disable_confidence_casting)(
-                self.confidence_head.__call__
-            )(
-                single_repr=single.detach(),
-                single_inputs_repr=single_inputs.detach(),
-                pairwise_repr=pairwise.detach(),
-                pred_atom_pos=model_preds["mini_denoised_atom_pos"].detach(),
-                molecule_atom_indices=molecule_atom_indices,
-                molecule_atom_lens=molecule_atom_lens,
-                is_ligand_atom_res_idx=is_ligand_atom_res_idx,
-                mask=mask,
-                atom_feats=atom_feats.detach(),
-                num_ligands=num_ligands,
-                return_pae_logits=True,
-                use_optimized_evo=use_optimized_evo,
-            )
+            with nvtx_range("model.confidence_head"):
+                ch_logits = autocasting_disable_decorator(self.disable_confidence_casting)(
+                    self.confidence_head.__call__
+                )(
+                    single_repr=single.detach(),
+                    single_inputs_repr=single_inputs.detach(),
+                    pairwise_repr=pairwise.detach(),
+                    pred_atom_pos=model_preds["mini_denoised_atom_pos"].detach(),
+                    molecule_atom_indices=molecule_atom_indices,
+                    molecule_atom_lens=molecule_atom_lens,
+                    is_ligand_atom_res_idx=is_ligand_atom_res_idx,
+                    mask=mask,
+                    atom_feats=atom_feats.detach(),
+                    num_ligands=num_ligands,
+                    return_pae_logits=True,
+                    use_optimized_evo=use_optimized_evo,
+                )
             model_preds.update(
                 {
                     "pde": ch_logits.pde,
@@ -9995,23 +10008,24 @@ class MegaFold(Module):
 
             # calculate the loss
 
-            loss, loss_breakdown = autocasting_disable_decorator(self.disable_loss_casting)(
-                self.loss.__call__
-            )(
-                model_preds,
-                model_labels,
-                molecule_atom_lens=molecule_atom_lens,
-                is_molecule_types=is_molecule_types,
-                atom_mask=atom_mask,
-                valid_atom_indices_for_frame=valid_atom_indices_for_frame,
-                atom_indices_for_frame=atom_indices_for_frame,
-                bond_mask=bond_mask,
-                missing_atom_mask=missing_atom_mask,
-                distogram_atom_indices=distogram_atom_indices,
-                molecule_atom_indices=molecule_atom_indices,
-                valid_distogram_mask=valid_distogram_mask,
-                valid_molecule_atom_mask=valid_molecule_atom_mask,
-            )
+            with nvtx_range("model.loss"):
+                loss, loss_breakdown = autocasting_disable_decorator(self.disable_loss_casting)(
+                    self.loss.__call__
+                )(
+                    model_preds,
+                    model_labels,
+                    molecule_atom_lens=molecule_atom_lens,
+                    is_molecule_types=is_molecule_types,
+                    atom_mask=atom_mask,
+                    valid_atom_indices_for_frame=valid_atom_indices_for_frame,
+                    atom_indices_for_frame=atom_indices_for_frame,
+                    bond_mask=bond_mask,
+                    missing_atom_mask=missing_atom_mask,
+                    distogram_atom_indices=distogram_atom_indices,
+                    molecule_atom_indices=molecule_atom_indices,
+                    valid_distogram_mask=valid_distogram_mask,
+                    valid_molecule_atom_mask=valid_molecule_atom_mask,
+                )
             self.print(f"MSAModule forward time over the steps: {self.msamodule_time}")
             self.print(f"TemplateEmbedder forward time over the steps: {self.templateembedder_time}")
             self.print(f"Pairformer forward time over the steps: {self.pairformer_time}")

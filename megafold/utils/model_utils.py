@@ -28,7 +28,7 @@ import importlib.metadata
 import json
 import os
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from pathlib import Path
 
@@ -61,6 +61,41 @@ IS_MOLECULE_TYPES = 5
 # helper functions
 
 _PAIR_BIAS_CAPTURE_STATE = {"count": 0, "seen": 0}
+
+
+def nvtx_enabled() -> bool:
+    value = os.environ.get("MEGAFOLD_NVTX", "")
+    return value.lower() not in {"", "0", "false", "no"}
+
+
+def autograd_nvtx_enabled() -> bool:
+    value = os.environ.get("MEGAFOLD_AUTOGRAD_NVTX", "")
+    return value.lower() not in {"", "0", "false", "no"}
+
+
+@contextmanager
+def nvtx_range(message: str):
+    if not nvtx_enabled() or not torch.cuda.is_available():
+        yield
+        return
+
+    import torch.cuda.nvtx as nvtx
+
+    nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
+
+
+@contextmanager
+def maybe_emit_nvtx(record_shapes: bool = False):
+    if not autograd_nvtx_enabled() or not torch.cuda.is_available():
+        yield
+        return
+
+    with torch.autograd.profiler.emit_nvtx(record_shapes=record_shapes):
+        yield
 
 
 def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pair_bias") -> None:
@@ -2164,21 +2199,22 @@ class MegaFoldLoss(Module):
 
         # calculate main diffusion MSE loss
 
-        per_atom_se = ((denoised_atom_pos - atom_pos_aligned) ** 2).sum(dim=-1)
-        per_sample_weighted_mse = (align_weights * per_atom_se).sum(dim=-1) / (
-            atom_mask.sum(dim=-1) + eps
-        )
+        with nvtx_range("loss.diffusion.mse"):
+            per_atom_se = ((denoised_atom_pos - atom_pos_aligned) ** 2).sum(dim=-1)
+            per_sample_weighted_mse = (align_weights * per_atom_se).sum(dim=-1) / (
+                atom_mask.sum(dim=-1) + eps
+            )
 
-        if exists(loss_weights):
-            per_sample_weighted_mse = per_sample_weighted_mse * loss_weights
+            if exists(loss_weights):
+                per_sample_weighted_mse = per_sample_weighted_mse * loss_weights
 
-        weighted_align_mse_loss = self.diffusion_mse_weight * (per_sample_weighted_mse).mean(
-            dim=-1
-        )
+            weighted_align_mse_loss = self.diffusion_mse_weight * (
+                per_sample_weighted_mse
+            ).mean(dim=-1)
 
-        mse_loss = weighted_align_mse_loss.mean()
+            mse_loss = weighted_align_mse_loss.mean()
 
-        diffusion_loss = diffusion_loss + mse_loss
+            diffusion_loss = diffusion_loss + mse_loss
 
         # construct atom pair mask for either smooth lDDT loss or bond loss
 
@@ -2189,94 +2225,96 @@ class MegaFoldLoss(Module):
         bond_loss = self.zero.type(dtype)
 
         if self.diffusion_add_bond_loss and exists(bond_mask):
-            atompair_bond_mask = atompair_mask * bond_mask
+            with nvtx_range("loss.diffusion.bond"):
+                atompair_bond_mask = atompair_mask * bond_mask
 
-            bond_losses = []
-            num_augs = denoised_atom_pos.shape[-3]
-            diffusion_num_chunks = num_augs // self.diffusion_chunk_size + (
-                num_augs % self.diffusion_chunk_size != 0
-            )
-            for i in range(diffusion_num_chunks):
-                bond_loss_i = checkpoint(
-                    self.calculate_bond_loss,
-                    denoised_atom_pos[
-                        ...,
-                        i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
-                        :,
-                        :,
-                    ],
-                    atom_pos_aligned[
-                        ...,
-                        i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
-                        :,
-                        :,
-                    ],
-                    atompair_bond_mask,
+                bond_losses = []
+                num_augs = denoised_atom_pos.shape[-3]
+                diffusion_num_chunks = num_augs // self.diffusion_chunk_size + (
+                    num_augs % self.diffusion_chunk_size != 0
                 )
-                bond_losses.append(bond_loss_i)
-            bond_losses = torch.cat(bond_losses, dim=-1)
+                for i in range(diffusion_num_chunks):
+                    bond_loss_i = checkpoint(
+                        self.calculate_bond_loss,
+                        denoised_atom_pos[
+                            ...,
+                            i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
+                            :,
+                            :,
+                        ],
+                        atom_pos_aligned[
+                            ...,
+                            i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
+                            :,
+                            :,
+                        ],
+                        atompair_bond_mask,
+                    )
+                    bond_losses.append(bond_loss_i)
+                bond_losses = torch.cat(bond_losses, dim=-1)
 
-            if exists(loss_weights):
-                bond_losses = bond_losses * loss_weights
+                if exists(loss_weights):
+                    bond_losses = bond_losses * loss_weights
 
-            bond_loss = bond_losses.mean(dim=-1).mean()
+                bond_loss = bond_losses.mean(dim=-1).mean()
 
-            diffusion_loss = diffusion_loss + bond_loss
+                diffusion_loss = diffusion_loss + bond_loss
 
         # calculate auxiliary smooth lDDT loss
 
         smooth_lddt_loss = self.zero.type(dtype)
 
         if self.diffusion_add_smooth_lddt_loss:
-            assert exists(
-                is_molecule_types
-            ), "The argument `is_molecule_types` must be passed in if adding the smooth lDDT loss."
+            with nvtx_range("loss.diffusion.smooth_lddt"):
+                assert exists(
+                    is_molecule_types
+                ), "The argument `is_molecule_types` must be passed in if adding the smooth lDDT loss."
 
-            is_nucleotide_or_ligand_fields = is_molecule_types.unbind(dim=-1)
+                is_nucleotide_or_ligand_fields = is_molecule_types.unbind(dim=-1)
 
-            is_nucleotide_or_ligand_fields = tuple(
-                batch_repeat_interleave(t, molecule_atom_lens)
-                for t in is_nucleotide_or_ligand_fields
-            )
-            is_nucleotide_or_ligand_fields = tuple(
-                pad_or_slice_to(t, length=align_weights.shape[-1], dim=-1)
-                for t in is_nucleotide_or_ligand_fields
-            )
-
-            _, atom_is_dna, atom_is_rna, _, _ = is_nucleotide_or_ligand_fields
-
-            lddt_losses = []
-            num_augs = denoised_atom_pos.shape[-3]
-            num_chunks = num_augs // self.diffusion_chunk_size + (
-                num_augs % self.diffusion_chunk_size != 0
-            )
-            for i in range(num_chunks):
-                lddt_i = checkpoint(
-                    self.smooth_lddt_loss.__call__,
-                    denoised_atom_pos[
-                        ...,
-                        i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
-                        :,
-                        :,
-                    ],
-                    atom_pos_aligned[
-                        ...,
-                        i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
-                        :,
-                        :,
-                    ],
-                    atom_is_dna,
-                    atom_is_rna,
-                    atom_mask,
-                    atompair_mask,
+                is_nucleotide_or_ligand_fields = tuple(
+                    batch_repeat_interleave(t, molecule_atom_lens)
+                    for t in is_nucleotide_or_ligand_fields
                 )
-                lddt_losses.append(lddt_i)
-            lddt_losses = torch.cat(lddt_losses, dim=-1)
+                is_nucleotide_or_ligand_fields = tuple(
+                    pad_or_slice_to(t, length=align_weights.shape[-1], dim=-1)
+                    for t in is_nucleotide_or_ligand_fields
+                )
 
-            lddt_loss = lddt_losses.mean(dim=-1)
-            smooth_lddt_loss = 1 - lddt_loss.mean()
+                _, atom_is_dna, atom_is_rna, _, _ = is_nucleotide_or_ligand_fields
 
-            diffusion_loss = diffusion_loss + smooth_lddt_loss
+                lddt_losses = []
+                num_augs = denoised_atom_pos.shape[-3]
+                num_chunks = num_augs // self.diffusion_chunk_size + (
+                    num_augs % self.diffusion_chunk_size != 0
+                )
+                for i in range(num_chunks):
+                    lddt_i = checkpoint(
+                        self.smooth_lddt_loss.__call__,
+                        denoised_atom_pos[
+                            ...,
+                            i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
+                            :,
+                            :,
+                        ],
+                        atom_pos_aligned[
+                            ...,
+                            i * self.diffusion_chunk_size : (i + 1) * self.diffusion_chunk_size,
+                            :,
+                            :,
+                        ],
+                        atom_is_dna,
+                        atom_is_rna,
+                        atom_mask,
+                        atompair_mask,
+                    )
+                    lddt_losses.append(lddt_i)
+                lddt_losses = torch.cat(lddt_losses, dim=-1)
+
+                lddt_loss = lddt_losses.mean(dim=-1)
+                smooth_lddt_loss = 1 - lddt_loss.mean()
+
+                diffusion_loss = diffusion_loss + smooth_lddt_loss
 
         # calculate loss breakdown
 
@@ -2343,143 +2381,140 @@ class MegaFoldLoss(Module):
         pae_labels = None
 
         if self.train_pae and exists(atom_indices_for_frame):
-            denoised_molecule_pos = denoised_atom_pos.gather(1, distogram_atom_coords_indices)
+            with nvtx_range("loss.confidence.labels.pae"):
+                denoised_molecule_pos = denoised_atom_pos.gather(
+                    1, distogram_atom_coords_indices
+                )
 
-            # get frame atom positions
-            # three_atoms = einx.get_at('b [m] c, b n three -> three b n c', atom_pos_aligned, atom_indices_for_frame)
-            # pred_three_atoms = einx.get_at('b [m] c, b n three -> three b n c', denoised_atom_pos, atom_indices_for_frame)
+                # get frame atom positions
+                # three_atoms = einx.get_at('b [m] c, b n three -> three b n c', atom_pos_aligned, atom_indices_for_frame)
+                # pred_three_atoms = einx.get_at('b [m] c, b n three -> three b n c', denoised_atom_pos, atom_indices_for_frame)
 
-            atom_indices_for_frame = repeat(
-                atom_indices_for_frame, "b n three -> three b n c", c=3
-            )
-            three_atom_pos = repeat(atom_pos_aligned, "b m c -> three b m c", three=3)
-            three_denoised_atom_pos = repeat(denoised_atom_pos, "b m c -> three b m c", three=3)
+                atom_indices_for_frame = repeat(
+                    atom_indices_for_frame, "b n three -> three b n c", c=3
+                )
+                three_atom_pos = repeat(atom_pos_aligned, "b m c -> three b m c", three=3)
+                three_denoised_atom_pos = repeat(
+                    denoised_atom_pos, "b m c -> three b m c", three=3
+                )
 
-            three_atoms = three_atom_pos.gather(2, atom_indices_for_frame)
-            pred_three_atoms = three_denoised_atom_pos.gather(2, atom_indices_for_frame)
+                three_atoms = three_atom_pos.gather(2, atom_indices_for_frame)
+                pred_three_atoms = three_denoised_atom_pos.gather(2, atom_indices_for_frame)
 
-            # compute frames
-            frame_atoms = rearrange(three_atoms, "three b n c -> b n c three")
-            pred_frame_atoms = rearrange(pred_three_atoms, "three b n c -> b n c three")
+                # compute frames
+                frame_atoms = rearrange(three_atoms, "three b n c -> b n c three")
+                pred_frame_atoms = rearrange(pred_three_atoms, "three b n c -> b n c three")
 
-            # determine mask
-            # must be amino acid, nucleotide, or ligand with greater than 0 atoms
-            align_error_mask = valid_atom_indices_for_frame
+                # determine mask
+                # must be amino acid, nucleotide, or ligand with greater than 0 atoms
+                align_error_mask = valid_atom_indices_for_frame
 
-            # align error
-            align_error = self.compute_alignment_error(
-                denoised_molecule_pos.float(),
-                molecule_pos.float(),
-                pred_frame_atoms,  # NOTE: in paragraph 2 of AF3 Section 4.3.2, `\Phi_i` denotes the coordinates of the frame atoms rather than the frame rotation matrix
-                frame_atoms,
-                mask=align_error_mask,
-            ).type(dtype)
+                # align error
+                align_error = self.compute_alignment_error(
+                    denoised_molecule_pos.float(),
+                    molecule_pos.float(),
+                    pred_frame_atoms,  # NOTE: in paragraph 2 of AF3 Section 4.3.2, `\Phi_i` denotes the coordinates of the frame atoms rather than the frame rotation matrix
+                    frame_atoms,
+                    mask=align_error_mask,
+                ).type(dtype)
 
-            # calculate pae labels as alignment error binned to 64 (0 - 32A)
-            pae_labels = distance_to_dgram(align_error, self.pae_bins, return_labels=True)
+                # calculate pae labels as alignment error binned to 64 (0 - 32A)
+                pae_labels = distance_to_dgram(align_error, self.pae_bins, return_labels=True)
 
-            # set ignore index for invalid molecules or frames
-            pair_align_error_mask = to_pairwise_mask(align_error_mask)
+                # set ignore index for invalid molecules or frames
+                pair_align_error_mask = to_pairwise_mask(align_error_mask)
 
-            # pae_labels = einx.where(
-            #     "b i j, b i j, -> b i j", pair_align_error_mask, pae_labels, self.ignore_index
-            # )
-            pae_labels = pae_labels.masked_fill(~pair_align_error_mask, self.ignore_index)
+                # pae_labels = einx.where(
+                #     "b i j, b i j, -> b i j", pair_align_error_mask, pae_labels, self.ignore_index
+                # )
+                pae_labels = pae_labels.masked_fill(~pair_align_error_mask, self.ignore_index)
 
         # determine PDE labels
 
         # molecule_pos = einx.get_at('b [m] c, b n -> b n c', atom_pos_aligned, molecule_atom_indices)
 
-        molecule_atom_coords_indices = repeat(
-            molecule_atom_indices, "b n -> b n c", c=atom_pos_aligned.shape[-1]
-        )
+        with nvtx_range("loss.confidence.labels.pde"):
+            molecule_atom_coords_indices = repeat(
+                molecule_atom_indices, "b n -> b n c", c=atom_pos_aligned.shape[-1]
+            )
 
-        molecule_pos = atom_pos_aligned.gather(1, molecule_atom_coords_indices)
-        denoised_molecule_pos = denoised_atom_pos.gather(1, molecule_atom_coords_indices)
+            molecule_pos = atom_pos_aligned.gather(1, molecule_atom_coords_indices)
+            denoised_molecule_pos = denoised_atom_pos.gather(1, molecule_atom_coords_indices)
 
-        molecule_mask = valid_molecule_atom_mask
+            molecule_mask = valid_molecule_atom_mask
 
-        pde_gt_dist = torch.cdist(molecule_pos.float(), molecule_pos.float(), p=2).type(dtype)
-        pde_pred_dist = torch.cdist(
-            denoised_molecule_pos.float(),
-            denoised_molecule_pos.float(),
-            p=2,
-        ).type(dtype)
+            pde_gt_dist = torch.cdist(
+                molecule_pos.float(), molecule_pos.float(), p=2
+            ).type(dtype)
+            pde_pred_dist = torch.cdist(
+                denoised_molecule_pos.float(),
+                denoised_molecule_pos.float(),
+                p=2,
+            ).type(dtype)
 
-        # calculate PDE labels as distance error binned to 64 (0 - 32A)
-        pde_dist = torch.abs(pde_pred_dist - pde_gt_dist)
-        pde_labels = distance_to_dgram(pde_dist, self.pde_bins, return_labels=True)
-
-        # account for representative molecule atom missing from residue (`-1` set on the `molecule_atom_indices` field)
-        pde_labels.masked_fill_(~to_pairwise_mask(molecule_mask), self.ignore_index)
+            pde_dist = torch.abs(pde_pred_dist - pde_gt_dist)
+            pde_labels = distance_to_dgram(pde_dist, self.pde_bins, return_labels=True)
+            pde_labels.masked_fill_(~to_pairwise_mask(molecule_mask), self.ignore_index)
 
         # determine plDDT labels if possible
 
-        pred_coords, true_coords = denoised_atom_pos, atom_pos_aligned
+        with nvtx_range("loss.confidence.labels.plddt"):
+            pred_coords, true_coords = denoised_atom_pos, atom_pos_aligned
+            pred_dists = torch.cdist(pred_coords.float(), pred_coords.float(), p=2).type(dtype)
+            true_dists = torch.cdist(true_coords.float(), true_coords.float(), p=2).type(dtype)
 
-        # compute distances between all pairs of atoms
-        pred_dists = torch.cdist(pred_coords.float(), pred_coords.float(), p=2).type(dtype)
-        true_dists = torch.cdist(true_coords.float(), true_coords.float(), p=2).type(dtype)
+            is_protein = batch_repeat_interleave(
+                is_molecule_types[..., IS_PROTEIN_INDEX], molecule_atom_lens
+            )
+            is_rna = batch_repeat_interleave(
+                is_molecule_types[..., IS_RNA_INDEX], molecule_atom_lens
+            )
+            is_dna = batch_repeat_interleave(
+                is_molecule_types[..., IS_DNA_INDEX], molecule_atom_lens
+            )
 
-        # restrict to bespoke interaction types and inclusion radius on the atom level (Section 4.3.1)
-        is_protein = batch_repeat_interleave(
-            is_molecule_types[..., IS_PROTEIN_INDEX], molecule_atom_lens
-        )
-        is_rna = batch_repeat_interleave(is_molecule_types[..., IS_RNA_INDEX], molecule_atom_lens)
-        is_dna = batch_repeat_interleave(is_molecule_types[..., IS_DNA_INDEX], molecule_atom_lens)
+            is_nucleotide = is_rna | is_dna
+            is_polymer = is_protein | is_rna | is_dna
 
-        is_nucleotide = is_rna | is_dna
-        is_polymer = is_protein | is_rna | is_dna
+            is_any_nucleotide_pair = repeat(
+                is_nucleotide, "... j -> ... i j", i=is_nucleotide.shape[-1]
+            )
+            is_any_polymer_pair = repeat(is_polymer, "... j -> ... i j", i=is_polymer.shape[-1])
 
-        is_any_nucleotide_pair = repeat(
-            is_nucleotide, "... j -> ... i j", i=is_nucleotide.shape[-1]
-        )
-        is_any_polymer_pair = repeat(is_polymer, "... j -> ... i j", i=is_polymer.shape[-1])
+            inclusion_radius = torch.where(
+                is_any_nucleotide_pair,
+                true_dists < self.lddt_mask_nucleic_acid_cutoff,
+                true_dists < self.lddt_mask_other_cutoff,
+            )
 
-        inclusion_radius = torch.where(
-            is_any_nucleotide_pair,
-            true_dists < self.lddt_mask_nucleic_acid_cutoff,
-            true_dists < self.lddt_mask_other_cutoff,
-        )
+            is_token_center_atom = torch.zeros_like(atom_pos_aligned[..., 0], dtype=torch.bool)
+            is_token_center_atom[
+                torch.arange(batch_size).unsqueeze(1), molecule_atom_indices
+            ] = True
+            is_any_token_center_atom_pair = repeat(
+                is_token_center_atom,
+                "... j -> ... i j",
+                i=is_token_center_atom.shape[-1],
+            )
 
-        is_token_center_atom = torch.zeros_like(atom_pos_aligned[..., 0], dtype=torch.bool)
-        is_token_center_atom[torch.arange(batch_size).unsqueeze(1), molecule_atom_indices] = True
-        is_any_token_center_atom_pair = repeat(
-            is_token_center_atom,
-            "... j -> ... i j",
-            i=is_token_center_atom.shape[-1],
-        )
+            plddt_mask = (
+                inclusion_radius
+                & is_any_polymer_pair
+                & is_any_token_center_atom_pair
+                & ~torch.eye(atom_seq_len, dtype=torch.bool, device=device)
+            )
+            plddt_mask = plddt_mask * to_pairwise_mask(atom_mask)
 
-        # compute masks, avoiding self term
-        plddt_mask = (
-            inclusion_radius
-            & is_any_polymer_pair
-            & is_any_token_center_atom_pair
-            & ~torch.eye(atom_seq_len, dtype=torch.bool, device=device)
-        )
+            dist_diff = torch.abs(true_dists - pred_dists)
+            lddt = self.lddt_thresholds[None, None, None, :] - dist_diff[..., None]
+            lddt = (lddt >= 0).type(dtype).mean(dim=-1)
+            lddt_mean = masked_average(lddt, plddt_mask, dim=-1)
 
-        plddt_mask = plddt_mask * to_pairwise_mask(atom_mask)
-
-        # compute distance difference for all pairs of atoms
-        dist_diff = torch.abs(true_dists - pred_dists)
-
-        # lddt = einx.subtract(
-        #     "thresholds, ... -> ... thresholds", self.lddt_thresholds, dist_diff
-        # )
-        lddt = self.lddt_thresholds[None, None, None, :] - dist_diff[..., None]
-        lddt = (lddt >= 0).type(dtype).mean(dim=-1)
-
-        # calculate masked averaging,
-        # after which we assign each value to one of 50 equally sized bins
-        lddt_mean = masked_average(lddt, plddt_mask, dim=-1)
-
-        plddt_labels = torch.clamp(
-            torch.floor(lddt_mean * self.num_plddt_bins).long(),
-            max=self.num_plddt_bins - 1,
-        )
-
-        # account for missing atoms (`False` set on the `atom_mask` field)
-        plddt_labels.masked_fill_(~atom_mask, self.ignore_index)
+            plddt_labels = torch.clamp(
+                torch.floor(lddt_mean * self.num_plddt_bins).long(),
+                max=self.num_plddt_bins - 1,
+            )
+            plddt_labels.masked_fill_(~atom_mask, self.ignore_index)
 
         # account for missing atoms in resolved labels (`False` set on the `atom_mask` field)
 
@@ -2579,87 +2614,90 @@ class MegaFoldLoss(Module):
 
         # calculate PAE loss as requested
 
-        if self.train_pae and exists(pae_labels):
-            train_pae_weight = 1.0 if self.train_pae else 0.0
-            pae_loss = (
-                self.calculate_cross_entropy_with_weight(
-                    pae_logits,
-                    pae_labels,
+        with nvtx_range("loss.confidence.pae"):
+            if self.train_pae and exists(pae_labels):
+                train_pae_weight = 1.0 if self.train_pae else 0.0
+                pae_loss = (
+                    self.calculate_cross_entropy_with_weight(
+                        pae_logits,
+                        pae_labels,
+                        confidence_weight,
+                        label_pairwise_mask,
+                        self.ignore_index,
+                    )
+                    * train_pae_weight
+                )
+            else:
+                pae_loss = (pae_logits * 0.0).mean()
+
+        # calculate PDE loss as requested
+
+        with nvtx_range("loss.confidence.pde"):
+            if exists(pde_labels):
+                pde_loss = self.calculate_cross_entropy_with_weight(
+                    pde_logits,
+                    pde_labels,
                     confidence_weight,
                     label_pairwise_mask,
                     self.ignore_index,
                 )
-                * train_pae_weight
-            )
-        else:
-            # ensure PAE logits always contribute to the loss
-            pae_loss = (pae_logits * 0.0).mean()
-
-        # calculate PDE loss as requested
-
-        if exists(pde_labels):
-            pde_loss = self.calculate_cross_entropy_with_weight(
-                pde_logits,
-                pde_labels,
-                confidence_weight,
-                label_pairwise_mask,
-                self.ignore_index,
-            )
-        else:
-            # ensure PDE logits always contribute to the loss
-            pde_loss = (pde_logits * 0.0).mean()
+            else:
+                pde_loss = (pde_logits * 0.0).mean()
 
         # calculate plDDT loss as requested
 
-        if exists(plddt_labels):
-            plddt_loss = self.calculate_cross_entropy_with_weight(
-                plddt_logits, plddt_labels, confidence_weight, label_mask, self.ignore_index
-            )
-        else:
-            # ensure plDDT logits always contribute to the loss
-            plddt_loss = (plddt_logits * 0.0).mean()
+        with nvtx_range("loss.confidence.plddt"):
+            if exists(plddt_labels):
+                plddt_loss = self.calculate_cross_entropy_with_weight(
+                    plddt_logits,
+                    plddt_labels,
+                    confidence_weight,
+                    label_mask,
+                    self.ignore_index,
+                )
+            else:
+                plddt_loss = (plddt_logits * 0.0).mean()
 
         # calculate resolved loss as requested
 
-        if exists(resolved_labels):
-            resolved_loss = self.calculate_cross_entropy_with_weight(
-                resolved_logits,
-                resolved_labels,
-                confidence_weight,
-                label_mask,
-                self.ignore_index,
-            )
-        else:
-            # ensure resolved logits always contribute to the loss
-            resolved_loss = (resolved_logits * 0.0).mean()
+        with nvtx_range("loss.confidence.resolved"):
+            if exists(resolved_labels):
+                resolved_loss = self.calculate_cross_entropy_with_weight(
+                    resolved_logits,
+                    resolved_labels,
+                    confidence_weight,
+                    label_mask,
+                    self.ignore_index,
+                )
+            else:
+                resolved_loss = (resolved_logits * 0.0).mean()
 
         # calculate affinity loss as requested
 
-        if exists(affinity_labels):
-            # find the (batched) mean squared error over all ligands in the same complex, then calculate the mean of each batch
-            affinity_loss = sum(
-                sum(
-                    F.mse_loss(
-                        affinity_logits[i][j],
-                        (
-                            affinity_labels[i][j]
-                            if not affinity_labels[i][j].isnan().any()
-                            else affinity_logits[i][j]
-                        ),
-                        reduction="none",
+        with nvtx_range("loss.confidence.affinity"):
+            if exists(affinity_labels):
+                affinity_loss = sum(
+                    sum(
+                        F.mse_loss(
+                            affinity_logits[i][j],
+                            (
+                                affinity_labels[i][j]
+                                if not affinity_labels[i][j].isnan().any()
+                                else affinity_logits[i][j]
+                            ),
+                            reduction="none",
+                        )
+                        for j in range(len(affinity_logits[i]))
                     )
-                    for j in range(len(affinity_logits[i]))
-                )
-                / len(affinity_logits[i])
-                for i in range(len(affinity_logits))
-            ) / len(affinity_logits)
-        else:
-            # ensure affinity logits always contribute to the loss
-            affinity_loss = sum(
-                sum((affinity_logits[i][j] * 0.0) for j in range(len(affinity_logits[i])))
-                / len(affinity_logits[i])
-                for i in range(len(affinity_logits))
-            ) / len(affinity_logits)
+                    / len(affinity_logits[i])
+                    for i in range(len(affinity_logits))
+                ) / len(affinity_logits)
+            else:
+                affinity_loss = sum(
+                    sum((affinity_logits[i][j] * 0.0) for j in range(len(affinity_logits[i])))
+                    / len(affinity_logits[i])
+                    for i in range(len(affinity_logits))
+                ) / len(affinity_logits)
 
         confidence_loss = pae_loss + pde_loss + plddt_loss + resolved_loss + affinity_loss
 
@@ -2708,8 +2746,9 @@ class MegaFoldLoss(Module):
 
         # calculate masks
 
-        mask = molecule_atom_lens > 0
-        pairwise_mask = to_pairwise_mask(mask)
+        with nvtx_range("loss.masks"):
+            mask = molecule_atom_lens > 0
+            pairwise_mask = to_pairwise_mask(mask)
 
         # calculate the distogram loss as requested
 
@@ -2719,18 +2758,19 @@ class MegaFoldLoss(Module):
             and all(exists(t) for t in (atom_mask, distogram_atom_indices, valid_distogram_mask))
         )
         if calculate_distogram_loss:
-            distance_labels = self.calculate_distogram_labels(
-                atom_pos=model_labels["atom_pos"],
-                atom_mask=atom_mask,
-                distogram_atom_indices=distogram_atom_indices,
-                valid_distogram_mask=valid_distogram_mask,
-            )
-            distogram_loss = self.calculate_distogram_loss(
-                distogram_logits=model_preds["distogram"],
-                distogram_labels=distance_labels,
-                atom_mask=atom_mask,
-                pairwise_mask=pairwise_mask,
-            )
+            with nvtx_range("loss.distogram"):
+                distance_labels = self.calculate_distogram_labels(
+                    atom_pos=model_labels["atom_pos"],
+                    atom_mask=atom_mask,
+                    distogram_atom_indices=distogram_atom_indices,
+                    valid_distogram_mask=valid_distogram_mask,
+                )
+                distogram_loss = self.calculate_distogram_loss(
+                    distogram_logits=model_preds["distogram"],
+                    distogram_labels=distance_labels,
+                    atom_mask=atom_mask,
+                    pairwise_mask=pairwise_mask,
+                )
 
         # calculate the diffusion loss as requested
 
@@ -2749,17 +2789,18 @@ class MegaFoldLoss(Module):
             )
         )
         if calculate_diffusion_loss:
-            diffusion_loss, diffusion_loss_breakdown = self.calculate_diffusion_loss(
-                denoised_atom_pos=model_preds["denoised_atom_pos"],
-                atom_pos_aligned=model_labels["diffusion_atom_pos_aligned"],
-                align_weights=model_labels["diffusion_align_weights"],
-                loss_weights=model_labels["diffusion_loss_weights"],
-                molecule_atom_lens=molecule_atom_lens,
-                atom_mask=atom_mask,
-                bond_mask=bond_mask,
-                missing_atom_mask=missing_atom_mask,
-                is_molecule_types=is_molecule_types,
-            )
+            with nvtx_range("loss.diffusion"):
+                diffusion_loss, diffusion_loss_breakdown = self.calculate_diffusion_loss(
+                    denoised_atom_pos=model_preds["denoised_atom_pos"],
+                    atom_pos_aligned=model_labels["diffusion_atom_pos_aligned"],
+                    align_weights=model_labels["diffusion_align_weights"],
+                    loss_weights=model_labels["diffusion_loss_weights"],
+                    molecule_atom_lens=molecule_atom_lens,
+                    atom_mask=atom_mask,
+                    bond_mask=bond_mask,
+                    missing_atom_mask=missing_atom_mask,
+                    is_molecule_types=is_molecule_types,
+                )
 
         # calculate the confidence loss as requested
 
@@ -2785,60 +2826,63 @@ class MegaFoldLoss(Module):
             )
         )
         if calculate_confidence_loss:
-            (
-                pae_labels,
-                pde_labels,
-                plddt_labels,
-                resolved_labels,
-            ) = self.calculate_confidence_labels(
-                denoised_atom_pos=model_preds["mini_denoised_atom_pos"],
-                atom_pos_aligned=model_labels["mini_aligned_atom_pos"],
-                resolved_labels=model_labels["resolved_labels"],
-                atom_mask=atom_mask,
-                valid_atom_indices_for_frame=valid_atom_indices_for_frame,
-                atom_indices_for_frame=atom_indices_for_frame,
-                is_molecule_types=is_molecule_types,
-                molecule_atom_lens=molecule_atom_lens,
-                distogram_atom_indices=distogram_atom_indices,
-                molecule_atom_indices=molecule_atom_indices,
-                valid_molecule_atom_mask=valid_molecule_atom_mask,
-            )
+            with nvtx_range("loss.confidence.labels"):
+                (
+                    pae_labels,
+                    pde_labels,
+                    plddt_labels,
+                    resolved_labels,
+                ) = self.calculate_confidence_labels(
+                    denoised_atom_pos=model_preds["mini_denoised_atom_pos"],
+                    atom_pos_aligned=model_labels["mini_aligned_atom_pos"],
+                    resolved_labels=model_labels["resolved_labels"],
+                    atom_mask=atom_mask,
+                    valid_atom_indices_for_frame=valid_atom_indices_for_frame,
+                    atom_indices_for_frame=atom_indices_for_frame,
+                    is_molecule_types=is_molecule_types,
+                    molecule_atom_lens=molecule_atom_lens,
+                    distogram_atom_indices=distogram_atom_indices,
+                    molecule_atom_indices=molecule_atom_indices,
+                    valid_molecule_atom_mask=valid_molecule_atom_mask,
+                )
         else:
             # ensure the confidence logits are always in the computational graph
 
             skipped_confidence_loss = True
             pae_labels = pde_labels = plddt_labels = resolved_labels = None
 
-        (
-            confidence_loss,
-            pae_loss,
-            pde_loss,
-            plddt_loss,
-            resolved_loss,
-            affinity_loss,
-        ) = self.calculate_confidence_loss(
-            pae_logits=model_preds["pae"],
-            pde_logits=model_preds["pde"],
-            plddt_logits=model_preds["plddt"],
-            resolved_logits=model_preds["resolved"],
-            affinity_logits=model_preds["affinity"],
-            pae_labels=pae_labels,
-            pde_labels=pde_labels,
-            plddt_labels=plddt_labels,
-            mask=mask,
-            atom_mask=atom_mask,
-            resolved_labels=resolved_labels,
-            affinity_labels=model_labels["affinities"],
-            resolution=model_labels["resolution"],
-        )
+        with nvtx_range("loss.confidence"):
+            (
+                confidence_loss,
+                pae_loss,
+                pde_loss,
+                plddt_loss,
+                resolved_loss,
+                affinity_loss,
+            ) = self.calculate_confidence_loss(
+                pae_logits=model_preds["pae"],
+                pde_logits=model_preds["pde"],
+                plddt_logits=model_preds["plddt"],
+                resolved_logits=model_preds["resolved"],
+                affinity_logits=model_preds["affinity"],
+                pae_labels=pae_labels,
+                pde_labels=pde_labels,
+                plddt_labels=plddt_labels,
+                mask=mask,
+                atom_mask=atom_mask,
+                resolved_labels=resolved_labels,
+                affinity_labels=model_labels["affinities"],
+                resolution=model_labels["resolution"],
+            )
 
         # combine all the losses
 
-        loss = (
-            distogram_loss * self.distogram_weight
-            + diffusion_loss * self.diffusion_weight
-            + confidence_loss * self.confidence_weight
-        )
+        with nvtx_range("loss.combine"):
+            loss = (
+                distogram_loss * self.distogram_weight
+                + diffusion_loss * self.diffusion_weight
+                + confidence_loss * self.confidence_weight
+            )
 
         # nullify confidence loss if the confidence logits are not to be learned
 

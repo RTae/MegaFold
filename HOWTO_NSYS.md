@@ -6,6 +6,7 @@ This repo already had Nsight Compute support. This file covers tracing the real 
 
 - `train.py` now emits a top-level NVTX range named `train` when `MEGAFOLD_NVTX=1`.
 - `megafold/trainer.py` now emits a step-level NVTX range named `train.step_N`, plus nested ranges for dataloader, forward, backward, optimizer, EMA, zero-grad, and scheduler.
+- `megafold/model/megafold.py` and `megafold/utils/model_utils.py` now emit finer-grained NVTX ranges for trunk, diffusion, heads, and major loss terms.
 - `scripts/profile_nsys_train.sh` launches `train.py` directly for 1-GPU tracing and uses DeepSpeed only for multi-GPU tracing.
 
 ## Recommended first trace
@@ -90,6 +91,7 @@ nsys profile \
 
 - Keep the YAML field `profile: false` when using `nsys`. That field enables PyTorch profiler, which is a different tool and adds extra overhead.
 - `MEGAFOLD_MAX_STEPS` is an environment override for short debug or tracing runs. Set it to `0` to disable the limit.
+- Set `MEGAFOLD_AUTOGRAD_NVTX=1` if you want PyTorch autograd to emit extra NVTX markers inside backward for a more detailed kernel timeline.
 - By default the wrapper captures the NVTX range named `train`, so Python startup and DeepSpeed launcher setup stay out of the final trace.
 - With `--capture-step N`, the wrapper captures only the NVTX range `train.step_N`, which gives you one exact training step instead of the whole run.
 - For single-GPU configs like `configs/megafold_1x1_smoke.yaml`, the wrapper now calls `train.py` directly to avoid DeepSpeed launcher indirection preventing NVTX-triggered capture.
