@@ -77,8 +77,8 @@ nsys profile \
   --cpuctxsw=none \
   --wait=all \
   --capture-range=nvtx \
+  --capture-range-end=stop \
   --nvtx-capture=train.step_1 \
-  --stop-on-range-end=true \
   --force-overwrite=true \
   -o nsys_reports/manual_trace \
   deepspeed --master_port 29517 --num_gpus=1 train.py \

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 NSYS_CMD="${NSYS_CMD:-nsys}"
-DEEPSPEED_CMD="${DEEPSPEED_CMD:-deepspeed}"
+DEEPSPEED_CMD="${DEEPSPEED_CMD:-}"
 OUTPUT_DIR="${NSYS_OUTPUT_DIR:-${ROOT_DIR}/nsys_reports}"
 CONFIG="configs/megafold_1x1_smoke.yaml"
 TRAINER_NAME="initial_training"
@@ -15,6 +15,16 @@ CAPTURE_STEP=""
 MASTER_PORT="${MASTER_PORT:-29517}"
 OUTPUT_NAME=""
 EXTRA_ARGS=()
+
+if [[ -z "${DEEPSPEED_CMD}" ]]; then
+    if command -v deepspeed >/dev/null 2>&1; then
+        DEEPSPEED_CMD="deepspeed"
+    elif [[ -x "/home/rtae/miniconda3/envs/venv/bin/deepspeed" ]]; then
+        DEEPSPEED_CMD="/home/rtae/miniconda3/envs/venv/bin/deepspeed"
+    else
+        DEEPSPEED_CMD="deepspeed"
+    fi
+fi
 
 usage() {
     cat <<'EOF'
@@ -124,8 +134,8 @@ MEGAFOLD_MAX_STEPS="${EFFECTIVE_MAX_STEPS}" \
     --cpuctxsw=none \
     --wait=all \
     --capture-range=nvtx \
+    --capture-range-end=stop \
     --nvtx-capture="${CAPTURE_LABEL}" \
-    --stop-on-range-end=true \
     --force-overwrite=true \
     -o "${OUTPUT_PATH}" \
     "${DEEPSPEED_CMD}" --master_port "${MASTER_PORT}" --num_gpus="${NUM_GPUS}" train.py \
