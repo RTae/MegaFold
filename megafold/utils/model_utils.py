@@ -1097,7 +1097,7 @@ def weighted_rigid_align(
         return _weighted_rigid_align_impl(pred_coords, true_coords, weights, mask)
     except RuntimeError as err:
         err_msg = str(err).lower()
-        logger.error(f"Error in weighted_rigid_align: {err_msg}")
+        #logger.error(f"Error in weighted_rigid_align: {err_msg}")
         #raise SystemError(err_msg)
         is_linalg_backend_error = any(
             token in err_msg for token in ("cublas", "cusolver", "linalg", "svd", "magma")
