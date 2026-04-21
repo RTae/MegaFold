@@ -11,3 +11,4 @@ data/pdb_data/data_caches/test_clusterings/*
 *.npy.gz
 logs/*
 outputs/*
+summary.csv
