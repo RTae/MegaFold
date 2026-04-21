@@ -98,6 +98,31 @@ def maybe_emit_nvtx(record_shapes: bool = False):
         yield
 
 
+def cuda_linalg_backend_override() -> str | None:
+    value = os.environ.get("MEGAFOLD_CUDA_LINALG_BACKEND", "magma").strip().lower()
+    if value in {"", "default", "none"}:
+        return None
+    return value
+
+
+@contextmanager
+def preferred_cuda_linalg_backend(device: torch.device | str):
+    device = torch.device(device)
+    preferred_linalg_library = getattr(torch.backends.cuda, "preferred_linalg_library", None)
+    backend = cuda_linalg_backend_override()
+
+    if device.type != "cuda" or not callable(preferred_linalg_library) or backend is None:
+        yield
+        return
+
+    previous_backend = preferred_linalg_library()
+    try:
+        preferred_linalg_library(backend)
+        yield
+    finally:
+        preferred_linalg_library(previous_backend)
+
+
 def maybe_capture_pair_bias(pair_bias: Tensor | tuple | None, *, tag: str = "pair_bias") -> None:
     """Optionally dump a pair-bias tensor and a few structural summary stats."""
     capture_dir = os.environ.get("MEGAFOLD_PAIR_BIAS_DIR")
@@ -1095,8 +1120,9 @@ def weighted_rigid_align(
             weights_ * true_coords_centered, pred_coords_centered, "b n i, b n j -> b i j"
         )
 
-        # Compute the SVD of the covariance matrix
-        U, S, V = torch.svd(cov_matrix)
+        # Use the modern linalg API so CUDA backend selection and fallback behavior are consistent.
+        U, S, Vh = torch.linalg.svd(cov_matrix, full_matrices=False)
+        V = Vh.transpose(-2, -1)
         U_T = U.transpose(-2, -1)
 
         # Catch ambiguous rotation by checking the magnitude of singular values
@@ -1129,36 +1155,35 @@ def weighted_rigid_align(
         return true_aligned_coords
 
     try:
-        return _weighted_rigid_align_impl(pred_coords, true_coords, weights, mask)
+        with preferred_cuda_linalg_backend(pred_coords.device):
+            return _weighted_rigid_align_impl(pred_coords, true_coords, weights, mask)
     except RuntimeError as err:
         err_msg = str(err).lower()
-        #logger.error(f"Error in weighted_rigid_align: {err_msg}")
-        #raise SystemError(err_msg)
+        logger.error(f"Error in weighted_rigid_align: {err_msg}")
         is_linalg_backend_error = any(
-            token in err_msg for token in ("cublas", "cusolver", "linalg", "svd", "magma")
+            token in err_msg
+            for token in (
+                "cublas",
+                "cusolver",
+                "preferred_linalg_library",
+                "linalg",
+                "svd",
+                "magma",
+            )
         )
         if not is_linalg_backend_error:
             raise
 
-        logger.warning("weighted_rigid_align hit a CUDA linalg error; retrying on CPU.")
-        weights_cpu = weights.float().to("cpu") if exists(weights) else None
-        mask_cpu = mask.to("cpu") if exists(mask) else None
-        out = _weighted_rigid_align_impl(
-            pred_coords.float().to("cpu"),
-            true_coords.float().to("cpu"),
-            weights_cpu,
-            mask_cpu,
-        )
+        backend = cuda_linalg_backend_override()
+        if pred_coords.device.type == "cuda":
+            raise SystemError(
+                "weighted_rigid_align failed on CUDA linear algebra while staying on GPU. "
+                f"Current backend override: {backend or 'default'}. "
+                "Try setting MEGAFOLD_CUDA_LINALG_BACKEND=magma or MEGAFOLD_CUDA_LINALG_BACKEND=default, "
+                "and verify your CUDA driver / PyTorch build are compatible."
+            ) from err
 
-        if return_transforms:
-            aligned, rot_matrix, translation = out
-            return (
-                aligned.to(device=pred_coords.device, dtype=pred_coords.dtype),
-                rot_matrix.to(device=pred_coords.device, dtype=pred_coords.dtype),
-                translation.to(device=pred_coords.device, dtype=pred_coords.dtype),
-            )
-
-        return out.to(device=pred_coords.device, dtype=pred_coords.dtype)
+        raise SystemError(err_msg) from err
 
 
 # checkpointing utils
