@@ -11,6 +11,7 @@ OUTPUT_DIR="${NSYS_OUTPUT_DIR:-${ROOT_DIR}/nsys_reports}"
 CONFIG="configs/megafold_1x1_smoke.yaml"
 TRAINER_NAME="initial_training"
 NUM_GPUS=1
+LAUNCHER="auto"
 MAX_STEPS="${MEGAFOLD_MAX_STEPS:-3}"
 CAPTURE_STEP=""
 MASTER_PORT="${MASTER_PORT:-29517}"
@@ -45,6 +46,7 @@ Options:
   --config PATH         Training config to run.
   --trainer-name NAME   Trainer name inside the YAML.
   --gpus N              Number of GPUs for DeepSpeed.
+    --launcher NAME       Launcher to use: auto, python, or deepspeed.
   --max-steps N         Stop after N optimizer steps. Use 0 for no limit.
     --capture-step N      Capture only NVTX range for optimizer step N.
   --output NAME         Output basename under nsys_reports/.
@@ -55,6 +57,7 @@ Examples:
     scripts/profile_nsys_train.sh --capture-step 1 --output steady_state_step1
   scripts/profile_nsys_train.sh --max-steps 5 --output smoke_trace
   scripts/profile_nsys_train.sh --config configs/megafold_1x1.yaml --gpus 1 --max-steps 10
+    scripts/profile_nsys_train.sh --config configs/megafold_1x1.yaml --gpus 1 --launcher deepspeed
   scripts/profile_nsys_train.sh --config configs/megafold_1x2.yaml --gpus 2 --max-steps 4
 EOF
 }
@@ -71,6 +74,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpus)
             NUM_GPUS="$2"
+            shift 2
+            ;;
+        --launcher)
+            LAUNCHER="$2"
             shift 2
             ;;
         --max-steps)
@@ -102,6 +109,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "${LAUNCHER}" != "auto" && "${LAUNCHER}" != "python" && "${LAUNCHER}" != "deepspeed" ]]; then
+    echo "Invalid --launcher value: ${LAUNCHER}. Expected auto, python, or deepspeed." >&2
+    exit 1
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 CAPTURE_MODE="nvtx"
@@ -130,7 +142,16 @@ fi
 OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_NAME}"
 
 TRAIN_CMD=()
-if [[ "${NUM_GPUS}" == "1" ]]; then
+EFFECTIVE_LAUNCHER="${LAUNCHER}"
+if [[ "${EFFECTIVE_LAUNCHER}" == "auto" ]]; then
+    if [[ "${NUM_GPUS}" == "1" ]]; then
+        EFFECTIVE_LAUNCHER="python"
+    else
+        EFFECTIVE_LAUNCHER="deepspeed"
+    fi
+fi
+
+if [[ "${EFFECTIVE_LAUNCHER}" == "python" ]]; then
     TRAIN_CMD=(
         "${PYTHON_CMD}" train.py
         --config "${CONFIG}"
@@ -152,6 +173,7 @@ echo "Tracing MegaFold training with Nsight Systems"
 echo "  Config: ${CONFIG}"
 echo "  Trainer: ${TRAINER_NAME}"
 echo "  GPUs: ${NUM_GPUS}"
+echo "  Launcher: ${EFFECTIVE_LAUNCHER}"
 echo "  Max steps: ${EFFECTIVE_MAX_STEPS}"
 if [[ -n "${CAPTURE_STEP}" ]]; then
     echo "  Capture step: ${CAPTURE_STEP}"

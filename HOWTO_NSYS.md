@@ -12,6 +12,8 @@ It also covers end-to-end inference tracing through `megafold/cli.py`.
 - `scripts/profile_nsys_train.sh` launches `train.py` directly for 1-GPU tracing and uses DeepSpeed only for multi-GPU tracing.
 - `scripts/profile_nsys_inference.sh` traces the inference CLI and captures end-to-end inference with NVTX ranges for input prep, trunk, diffusion steps, and output writing.
 
+If you prefer to match the README launch path exactly, `scripts/profile_nsys_train.sh` also supports `--launcher deepspeed` for single-GPU runs.
+
 ## Inference tracing
 
 End-to-end inference is traced through the CLI entrypoint in `megafold/cli.py`.
@@ -124,6 +126,14 @@ scripts/profile_nsys_train.sh \
   --max-steps 10 \
   --output megafold_1x1_trace
 
+# Match the README single-GPU launch command exactly under Nsight Systems
+scripts/profile_nsys_train.sh \
+  --config configs/megafold_1x1.yaml \
+  --gpus 1 \
+  --launcher deepspeed \
+  --max-steps 10 \
+  --output megafold_1x1_trace_ds
+
 # 4 steps on the 2-GPU config
 scripts/profile_nsys_train.sh \
   --config configs/megafold_1x2.yaml \
@@ -162,6 +172,7 @@ nsys profile \
 - By default the wrapper captures the NVTX range named `train`, so Python startup and DeepSpeed launcher setup stay out of the final trace.
 - With `--capture-step N`, the wrapper captures only the NVTX range `train.step_N`, which gives you one exact training step instead of the whole run.
 - For single-GPU configs like `configs/megafold_1x1_smoke.yaml`, the wrapper now calls `train.py` directly to avoid DeepSpeed launcher indirection preventing NVTX-triggered capture.
+- If you want the wrapper to use the same command shape as the README, pass `--launcher deepspeed`.
 
 ## Opening the report
 
